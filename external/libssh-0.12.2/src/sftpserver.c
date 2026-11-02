@@ -1064,7 +1064,6 @@ struct sftp_handle
     char *name;
 };
 
-SSH_SFTP_CALLBACK(process_unsupported);
 SSH_SFTP_CALLBACK(process_open);
 SSH_SFTP_CALLBACK(process_read);
 SSH_SFTP_CALLBACK(process_write);
@@ -1081,6 +1080,13 @@ SSH_SFTP_CALLBACK(process_symlink);
 SSH_SFTP_CALLBACK(process_remove);
 SSH_SFTP_CALLBACK(process_extended_statvfs);
 SSH_SFTP_CALLBACK(process_setstat);
+/* zsshd: rename, fstat, fsetstat and the two OpenSSH
+ * extensions this server already advertised but did not handle. */
+SSH_SFTP_CALLBACK(process_rename);
+SSH_SFTP_CALLBACK(process_fstat);
+SSH_SFTP_CALLBACK(process_fsetstat);
+SSH_SFTP_CALLBACK(process_extended_posix_rename);
+SSH_SFTP_CALLBACK(process_extended_hardlink);
 
 const struct sftp_message_handler message_handlers[] = {
     {"open", NULL, SSH_FXP_OPEN, process_open},
@@ -1088,9 +1094,9 @@ const struct sftp_message_handler message_handlers[] = {
     {"read", NULL, SSH_FXP_READ, process_read},
     {"write", NULL, SSH_FXP_WRITE, process_write},
     {"lstat", NULL, SSH_FXP_LSTAT, process_lstat},
-    {"fstat", NULL, SSH_FXP_FSTAT, process_unsupported},
+    {"fstat", NULL, SSH_FXP_FSTAT, process_fstat},
     {"setstat", NULL, SSH_FXP_SETSTAT, process_setstat},
-    {"fsetstat", NULL, SSH_FXP_FSETSTAT, process_unsupported},
+    {"fsetstat", NULL, SSH_FXP_FSETSTAT, process_fsetstat},
     {"opendir", NULL, SSH_FXP_OPENDIR, process_opendir},
     {"readdir", NULL, SSH_FXP_READDIR, process_readdir},
     {"remove", NULL, SSH_FXP_REMOVE, process_remove},
@@ -1098,7 +1104,7 @@ const struct sftp_message_handler message_handlers[] = {
     {"rmdir", NULL, SSH_FXP_RMDIR, process_rmdir},
     {"realpath", NULL, SSH_FXP_REALPATH, process_realpath},
     {"stat", NULL, SSH_FXP_STAT, process_stat},
-    {"rename", NULL, SSH_FXP_RENAME, process_unsupported},
+    {"rename", NULL, SSH_FXP_RENAME, process_rename},
     {"readlink", NULL, SSH_FXP_READLINK, process_readlink},
     {"symlink", NULL, SSH_FXP_SYMLINK, process_symlink},
     {"init", NULL, SSH_FXP_INIT, sftp_reply_version},
@@ -1108,6 +1114,8 @@ const struct sftp_message_handler message_handlers[] = {
 const struct sftp_message_handler extended_handlers[] = {
     /* here are some extended type handlers */
     {"statvfs", "statvfs@openssh.com", 0, process_extended_statvfs},
+    {"posix-rename", "posix-rename@openssh.com", 0, process_extended_posix_rename},
+    {"hardlink", "hardlink@openssh.com", 0, process_extended_hardlink},
     {NULL, NULL, 0, NULL},
 };
 
@@ -1912,13 +1920,200 @@ process_remove(sftp_client_message client_msg)
     return SSH_OK;
 }
 
-static int
-process_unsupported(sftp_client_message client_msg)
+/* zsshd: the handlers below follow OpenSSH's
+ * sftp-server.c. */
+
+/* Reply with the status for errno, or OK. */
+static void
+reply_errno_status(sftp_client_message client_msg, int rv, int saved_errno)
 {
-    sftp_reply_status(client_msg, SSH_FX_OP_UNSUPPORTED,
-                      "Operation not supported");
-    SSH_LOG(SSH_LOG_PROTOCOL, "Message type %d not implemented",
-            sftp_client_message_get_type(client_msg));
+    if (rv < 0) {
+        sftp_reply_status(client_msg, unix_errno_to_ssh_stat(saved_errno),
+                          strerror(saved_errno));
+    } else {
+        sftp_reply_status(client_msg, SSH_FX_OK, NULL);
+    }
+}
+
+/* The descriptor behind a file or directory handle, or -1. */
+static int
+handle_fd(sftp_client_message client_msg)
+{
+    struct sftp_handle *h = sftp_handle(client_msg->sftp, client_msg->handle);
+
+    if (h == NULL) {
+        return -1;
+    }
+    if (h->type == SFTP_FILE_HANDLE) {
+        return h->fd;
+    }
+    if (h->type == SFTP_DIR_HANDLE && h->dirp != NULL) {
+        return dirfd(h->dirp);
+    }
+    return -1;
+}
+
+/* SSH_FXP_RENAME (draft-ietf-secsh-filexfer-02): it is an error if newpath
+ * exists. As OpenSSH: a regular file is moved by link() + unlink(), so an
+ * existing target is never replaced; where hard links are not supported,
+ * fall back to rename() when newpath does not exist. Use the
+ * posix-rename@openssh.com extension to replace a file in one step. */
+static int
+process_rename(sftp_client_message client_msg)
+{
+    const char *oldpath = sftp_client_message_get_filename(client_msg);
+    const char *newpath = ssh_string_get_char(client_msg->data);
+    struct stat st, st_new;
+    int status = SSH_FX_OK;
+
+    if (oldpath == NULL || newpath == NULL) {
+        SSH_LOG(SSH_LOG_WARNING, "missing filename from in message");
+        sftp_reply_status(client_msg, SSH_FX_NO_SUCH_FILE, "File name error");
+        return SSH_ERROR;
+    }
+
+    SSH_LOG(SSH_LOG_PROTOCOL, "processing rename: %s -> %s", oldpath, newpath);
+
+    if (lstat(oldpath, &st) < 0) {
+        status = unix_errno_to_ssh_stat(errno);
+    } else if (S_ISREG(st.st_mode)) {
+        if (link(oldpath, newpath) < 0) {
+            int e = errno;
+            if (e == EOPNOTSUPP || e == ENOSYS || e == EXDEV || e == EPERM ||
+                e == EMLINK) {
+                if (lstat(newpath, &st_new) == 0) {
+                    status = SSH_FX_FAILURE; /* target exists */
+                } else if (rename(oldpath, newpath) < 0) {
+                    status = unix_errno_to_ssh_stat(errno);
+                }
+            } else {
+                status = unix_errno_to_ssh_stat(e);
+            }
+        } else if (unlink(oldpath) < 0) {
+            status = unix_errno_to_ssh_stat(errno);
+            (void)unlink(newpath); /* undo the link */
+        }
+    } else if (lstat(newpath, &st_new) == 0) {
+        status = SSH_FX_FAILURE; /* target exists */
+    } else if (rename(oldpath, newpath) < 0) {
+        status = unix_errno_to_ssh_stat(errno);
+    }
+
+    sftp_reply_status(client_msg, status, NULL);
+    return SSH_OK;
+}
+
+/* posix-rename@openssh.com: rename(2), replacing newpath in one step. */
+static int
+process_extended_posix_rename(sftp_client_message client_msg)
+{
+    const char *oldpath = sftp_client_message_get_filename(client_msg);
+    const char *newpath = ssh_string_get_char(client_msg->data);
+    int rv;
+
+    if (oldpath == NULL || newpath == NULL) {
+        SSH_LOG(SSH_LOG_WARNING, "missing filename from in message");
+        sftp_reply_status(client_msg, SSH_FX_NO_SUCH_FILE, "File name error");
+        return SSH_ERROR;
+    }
+
+    SSH_LOG(SSH_LOG_PROTOCOL, "processing posix-rename: %s -> %s",
+            oldpath, newpath);
+    rv = rename(oldpath, newpath);
+    reply_errno_status(client_msg, rv, errno);
+    return SSH_OK;
+}
+
+/* hardlink@openssh.com: link(2). */
+static int
+process_extended_hardlink(sftp_client_message client_msg)
+{
+    const char *oldpath = sftp_client_message_get_filename(client_msg);
+    const char *newpath = ssh_string_get_char(client_msg->data);
+    int rv;
+
+    if (oldpath == NULL || newpath == NULL) {
+        SSH_LOG(SSH_LOG_WARNING, "missing filename from in message");
+        sftp_reply_status(client_msg, SSH_FX_NO_SUCH_FILE, "File name error");
+        return SSH_ERROR;
+    }
+
+    SSH_LOG(SSH_LOG_PROTOCOL, "processing hardlink: %s -> %s",
+            oldpath, newpath);
+    rv = link(oldpath, newpath);
+    reply_errno_status(client_msg, rv, errno);
+    return SSH_OK;
+}
+
+static int
+process_fstat(sftp_client_message client_msg)
+{
+    struct sftp_attributes_struct attr;
+    struct stat st;
+    int fd = handle_fd(client_msg);
+
+    if (fd < 0) {
+        sftp_reply_status(client_msg, SSH_FX_INVALID_HANDLE, "Invalid handle");
+        return SSH_OK;
+    }
+    if (fstat(fd, &st) < 0) {
+        int saved_errno = errno;
+        SSH_LOG(SSH_LOG_PROTOCOL, "fstat failed: %s", strerror(saved_errno));
+        sftp_reply_status(client_msg, unix_errno_to_ssh_stat(saved_errno),
+                          NULL);
+        return SSH_OK;
+    }
+    stat_to_filexfer_attrib(&st, &attr);
+    sftp_reply_attr(client_msg, &attr);
+    return SSH_OK;
+}
+
+/* Same order and error handling as process_setstat, on the open descriptor. */
+static int
+process_fsetstat(sftp_client_message client_msg)
+{
+    uint32_t msg_flags = client_msg->attr->flags;
+    int fd = handle_fd(client_msg);
+
+    if (fd < 0) {
+        sftp_reply_status(client_msg, SSH_FX_INVALID_HANDLE, "Invalid handle");
+        return SSH_OK;
+    }
+
+    if ((msg_flags & SSH_FILEXFER_ATTR_SIZE) &&
+        ftruncate(fd, (off_t)client_msg->attr->size) < 0) {
+        goto fail;
+    }
+    if ((msg_flags & SSH_FILEXFER_ATTR_PERMISSIONS) &&
+        fchmod(fd, (mode_t)(client_msg->attr->permissions & 07777)) < 0) {
+        goto fail;
+    }
+    if ((msg_flags & SSH_FILEXFER_ATTR_UIDGID) &&
+        fchown(fd, client_msg->attr->uid, client_msg->attr->gid) < 0) {
+        goto fail;
+    }
+    if (msg_flags & SSH_FILEXFER_ATTR_ACMODTIME) {
+        struct timeval tv[2];
+
+        tv[0].tv_sec = client_msg->attr->atime;
+        tv[0].tv_usec = 0;
+        tv[1].tv_sec = client_msg->attr->mtime;
+        tv[1].tv_usec = 0;
+        if (futimes(fd, tv) < 0) {
+            goto fail;
+        }
+    }
+
+    sftp_reply_status(client_msg, SSH_FX_OK, NULL);
+    return SSH_OK;
+
+fail:
+    {
+        int saved_errno = errno;
+        SSH_LOG(SSH_LOG_PROTOCOL, "fsetstat failed: %s", strerror(saved_errno));
+        sftp_reply_status(client_msg, unix_errno_to_ssh_stat(saved_errno),
+                          NULL);
+    }
     return SSH_OK;
 }
 
