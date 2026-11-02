@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 
 #ifndef ZSSHD_PORT
@@ -53,8 +54,10 @@ struct session_state {
   int pty_cols;
   sftp_session sftp;
   struct ssh_channel_callbacks_struct sftp_data_cb;
-  /* SFTP bytes received but not yet answered (see sftp_queue_cb). */
+  /* SFTP bytes received but not yet answered (see sftp_queue_cb): the
+   * unanswered bytes are sftp_in[sftp_in_off .. sftp_in_len). */
   uint8_t *sftp_in;
+  size_t sftp_in_off;
   size_t sftp_in_len;
   size_t sftp_in_cap;
   ssh_channel channel;
@@ -238,6 +241,14 @@ static int sftp_queue_cb(ssh_session session, ssh_channel channel,
   if (len == 0) {
     return 0;
   }
+  if (st->sftp_in_len + len > st->sftp_in_cap && st->sftp_in_off > 0) {
+    /* Reuse the answered space at the front before growing. Safe while
+     * sftp_process_queue is inside libssh's callback: the packet it is
+     * answering was already copied out by libssh (see there). */
+    st->sftp_in_len -= st->sftp_in_off;
+    memmove(st->sftp_in, st->sftp_in + st->sftp_in_off, st->sftp_in_len);
+    st->sftp_in_off = 0;
+  }
   if (st->sftp_in_len + len > st->sftp_in_cap) {
     size_t cap = st->sftp_in_cap ? st->sftp_in_cap : 65536;
     while (cap < st->sftp_in_len + len) {
@@ -259,33 +270,33 @@ static int sftp_queue_cb(ssh_session session, ssh_channel channel,
  * partial packet at the end stays queued for the next poll. Returns -1 when
  * the session should end (bad packet, out of memory, request failed). */
 static int sftp_process_queue(ssh_session session, struct session_state *st) {
-  while (st->sftp_in_len >= 5) {
-    uint32_t plen = ((uint32_t)st->sftp_in[0] << 24) |
-                    ((uint32_t)st->sftp_in[1] << 16) |
-                    ((uint32_t)st->sftp_in[2] << 8) | (uint32_t)st->sftp_in[3];
+  while (st->sftp_in_len - st->sftp_in_off >= 5) {
+    uint8_t *p = st->sftp_in + st->sftp_in_off;
+    uint32_t plen = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                    ((uint32_t)p[2] << 8) | (uint32_t)p[3];
     if (plen < 1 || plen > SFTP_MAX_PACKET) {
       printf("[zsshd] sftp: bad packet length %u\n", (unsigned)plen);
       return -1;
     }
     size_t total = (size_t)plen + 4;
-    if (st->sftp_in_len < total) {
+    if (st->sftp_in_len - st->sftp_in_off < total) {
       break; /* wait for the rest of this packet */
     }
-    /* Take the packet out of the queue before answering it: the answer can
-     * poll the socket, and new data then lands in (and may move) the queue. */
-    uint8_t *pkt = malloc(total);
-    if (!pkt) {
-      return -1;
-    }
-    memcpy(pkt, st->sftp_in, total);
-    st->sftp_in_len -= total;
-    memmove(st->sftp_in, st->sftp_in + total, st->sftp_in_len);
+    /* Mark the packet answered before answering it: the answer can poll the
+     * socket, and new data then lands in (and may move) the queue. The packet
+     * itself is passed in place, with no copy: libssh's callback copies it
+     * into its own buffer (sftp_decode_channel_data_to_packet) before it does
+     * any I/O, and reads `p` no more once it has decoded exactly `total`
+     * bytes, so a move of the queue after that cannot touch it. */
+    st->sftp_in_off += total;
 
-    int rc = sftp_channel_default_data_callback(session, st->channel, pkt,
+    int rc = sftp_channel_default_data_callback(session, st->channel, p,
                                                 (uint32_t)total, 0, &st->sftp);
-    free(pkt);
     if (rc != (int)total) {
       return -1; /* libssh has already closed the channel */
+    }
+    if (st->sftp_in_off == st->sftp_in_len) {
+      st->sftp_in_off = st->sftp_in_len = 0; /* empty: start at the front */
     }
   }
   return 0;
@@ -411,16 +422,24 @@ static void *handle_session(void *arg) {
       if (ssh_channel_is_open(st.channel)) {
         (void)sftp_process_queue(session, &st);
       }
+      /* A subsystem ends with an exit status too (OpenSSH's sshd sends 0).
+       * Sent before sftp_free: that sends EOF, closes and frees the channel
+       * (at once if the client already closed it), so st.channel must not be
+       * used after it. Sending the exit status, EOF and close after sftp_free
+       * crashed the whole process when the client closed first. */
+      if (ssh_channel_is_open(st.channel)) {
+        ssh_channel_request_send_exit_status(st.channel, 0);
+      }
       if (st.sftp) {
         sftp_free(st.sftp);
         st.sftp = NULL;
+      } else {
+        ssh_channel_send_eof(st.channel);
+        ssh_channel_close(st.channel);
       }
+      st.channel = NULL;
       free(st.sftp_in);
       st.sftp_in = NULL;
-      /* A subsystem ends with an exit status too (OpenSSH's sshd sends 0). */
-      ssh_channel_request_send_exit_status(st.channel, 0);
-      ssh_channel_send_eof(st.channel);
-      ssh_channel_close(st.channel);
       wait_client_close(session, event);
     } else {
       int status = 0;
@@ -444,6 +463,56 @@ done:
   ssh_disconnect(session);
   ssh_free(session);
   return NULL;
+}
+
+/* --- session socket tuning -------------------------------------------- */
+
+/* Socket buffer size asked for on each session socket. 1 MB stays under
+ * FreeBSD's default kern.ipc.maxsockbuf (2 MB, of which about 1.78 MB is
+ * usable per buffer); a refused size is halved until it is taken. */
+#define SESSION_SOCKBUF (1024 * 1024)
+#define SESSION_SOCKBUF_MIN (128 * 1024)
+
+static int get_sockbuf(int fd, int opt) {
+  int v = -1;
+  socklen_t l = sizeof(v);
+  if (getsockopt(fd, SOL_SOCKET, opt, &v, &l) != 0) {
+    return -1;
+  }
+  return v;
+}
+
+static void set_sockbuf(int fd, int opt) {
+  for (int want = SESSION_SOCKBUF; want >= SESSION_SOCKBUF_MIN; want /= 2) {
+    if (setsockopt(fd, SOL_SOCKET, opt, &want, sizeof(want)) == 0) {
+      return;
+    }
+  }
+}
+
+/* Tune an accepted session socket before the key exchange:
+ *   - TCP_NODELAY. libssh sets it only on its client connect path, so the
+ *     server ran with Nagle on. An SFTP read reply is one full 32 KB channel
+ *     packet plus a small tail packet; with Nagle the tail waits for the
+ *     client's (delayed) ACK of the data before it, so a get at one request in
+ *     flight spent most of each round trip idle.
+ *   - Larger SO_SNDBUF/SO_RCVBUF for pipelined transfers. Setting a size turns
+ *     off FreeBSD's buffer autosizing on this socket, so the values before
+ *     and after go to the log to compare against.
+ * Every step is best effort: a failure is logged and the session goes on. */
+static void tune_session_socket(int fd) {
+  if (fd < 0) {
+    return;
+  }
+  int one = 1;
+  int nodelay = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  int snd0 = get_sockbuf(fd, SO_SNDBUF);
+  int rcv0 = get_sockbuf(fd, SO_RCVBUF);
+  set_sockbuf(fd, SO_SNDBUF);
+  set_sockbuf(fd, SO_RCVBUF);
+  printf("[zsshd] session socket: nodelay %s, sndbuf %d -> %d, rcvbuf %d -> %d\n",
+         nodelay == 0 ? "on" : "failed", snd0, get_sockbuf(fd, SO_SNDBUF), rcv0,
+         get_sockbuf(fd, SO_RCVBUF));
 }
 
 /* --- host key --------------------------------------------------------- */
@@ -593,6 +662,7 @@ int ssh_server_run(void) {
       ssh_free(session);
       continue;
     }
+    tune_session_socket((int)ssh_get_fd(session));
 
     pthread_t t;
     pthread_attr_t attr;
