@@ -1953,11 +1953,25 @@ handle_fd(sftp_client_message client_msg)
     return -1;
 }
 
+/* Some filesystems (the PS5's /data) answer link() with 0 but create no new
+ * name. Trust a link only once newpath is the same file as oldpath. */
+static int
+link_verified(const char *oldpath, const char *newpath)
+{
+    struct stat so, sn;
+
+    return lstat(oldpath, &so) == 0 && lstat(newpath, &sn) == 0 &&
+           so.st_dev == sn.st_dev && so.st_ino == sn.st_ino;
+}
+
 /* SSH_FXP_RENAME (draft-ietf-secsh-filexfer-02): it is an error if newpath
  * exists. As OpenSSH: a regular file is moved by link() + unlink(), so an
  * existing target is never replaced; where hard links are not supported,
- * fall back to rename() when newpath does not exist. Use the
- * posix-rename@openssh.com extension to replace a file in one step. */
+ * fall back to rename() when newpath does not exist. oldpath is unlinked
+ * only after link_verified(); a link() that reported success without
+ * creating newpath also falls back to rename() when newpath does not exist,
+ * and fails otherwise. Use the posix-rename@openssh.com extension to
+ * replace a file in one step. */
 static int
 process_rename(sftp_client_message client_msg)
 {
@@ -1988,6 +2002,13 @@ process_rename(sftp_client_message client_msg)
                 }
             } else {
                 status = unix_errno_to_ssh_stat(e);
+            }
+        } else if (!link_verified(oldpath, newpath)) {
+            /* link() reported success but made no newpath: nothing to undo */
+            if (lstat(newpath, &st_new) == 0) {
+                status = SSH_FX_FAILURE; /* target exists */
+            } else if (rename(oldpath, newpath) < 0) {
+                status = unix_errno_to_ssh_stat(errno);
             }
         } else if (unlink(oldpath) < 0) {
             status = unix_errno_to_ssh_stat(errno);
@@ -2041,6 +2062,12 @@ process_extended_hardlink(sftp_client_message client_msg)
     SSH_LOG(SSH_LOG_PROTOCOL, "processing hardlink: %s -> %s",
             oldpath, newpath);
     rv = link(oldpath, newpath);
+    if (rv == 0 && !link_verified(oldpath, newpath)) {
+        SSH_LOG(SSH_LOG_PROTOCOL, "hardlink: link() created no %s", newpath);
+        sftp_reply_status(client_msg, SSH_FX_OP_UNSUPPORTED,
+                          "Hard link not created");
+        return SSH_OK;
+    }
     reply_errno_status(client_msg, rv, errno);
     return SSH_OK;
 }
