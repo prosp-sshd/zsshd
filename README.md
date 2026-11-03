@@ -5,8 +5,8 @@ A minimal **SSH server payload for the PlayStation 5**, forked from
 SSH with a small set of built-in file commands, and a non-interactive mode so
 other payloads/mods can automate against it.
 
-> Homebrew for jailbroken consoles. Use on hardware you own. Passwordless root
-> over the network is the default — see **Authentication** before exposing it.
+> Homebrew for jailbroken consoles. Use on hardware you own. Logins are refused
+> until you set up a password or a public key — see **Authentication**.
 
 ## Features
 
@@ -14,7 +14,7 @@ other payloads/mods can automate against it.
   on first run at `/data/zsshd/hostkey`.
 - **Post-quantum key exchange** (`mlkem768x25519-sha256`, `sntrup761x25519-sha512`)
   — no "store now, decrypt later" warning from modern OpenSSH clients.
-- **Passwordless `root` by default**; optional password and/or public-key auth.
+- Password and/or public-key auth; no login until one is set up.
 - Interactive shell: eza-style `ls`, fish-style colored prompt, command history
   (Up/Down), and in-line editing (Left/Right, Home/End, Delete).
 - Built-in commands: `ls cd pwd cat echo whoami uname clear help exit`,
@@ -106,13 +106,20 @@ ssh root@<ps5-ip>
 
 ## Authentication
 
-Default: anyone can log in as `root` with **no password**. To require real auth,
-create either file on the console (the presence of either disables passwordless
-`none`):
+Create either file (or both) on the console to allow `root` logins:
 
-- `/data/zsshd/password` — first line is the accepted password.
+- `/data/zsshd/password` — first line is the accepted password (an empty first
+  line accepts nothing).
 - `/data/zsshd/authorized_keys` — OpenSSH `authorized_keys` format (one key per
   line; supports multiple keys).
+
+With neither file, **every login is refused**: there is no passwordless login,
+and the startup toast says `No login set up: all refused`. Both files are read
+on each login attempt, so adding one takes effect without restarting the
+payload.
+
+To allow public-key logins only, turn password login off with the
+`passwordauth` setting below; a `password` file is then ignored.
 
 ## Configuration
 
@@ -125,6 +132,7 @@ default — the same convention as the auth files above.
 | `port` | SSH listen port | `22` |
 | `bindaddr` | Listen on one interface/IP only (e.g. a LAN or Tailscale address) instead of all interfaces | all interfaces |
 | `loglevel` | libssh log verbosity, `0`–`4` (none → functions) | `0` |
+| `passwordauth` | `0` turns password login off (public-key only); `1` allows it | `1` |
 
 Set them straight from the console using shell redirection (0.7.0+), either in
 a zsshd session or via `ssh` exec from your client:
