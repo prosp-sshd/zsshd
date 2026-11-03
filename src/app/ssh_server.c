@@ -40,6 +40,22 @@
 static ssh_bind g_bind = NULL;
 static volatile sig_atomic_t g_running = 0;
 
+/* Session threads still running. Every session thread uses libssh's shared
+ * crypto state (the mbedtls RNG: each key exchange and every packet draws from
+ * it), which ssh_finalize() and, at process exit, libssh's destructor free.
+ * Stand-down therefore ends and waits for these threads before it returns
+ * (sessions_stand_down). A thread drawing after the free ran AES with a zeroed
+ * key schedule and read off the end of it: SIGSEGV in key exchange when a
+ * replacement payload stood the daemon down while a connection came in. */
+struct live_session {
+  ssh_session session;
+  int fd; /* its socket; -1 once the thread is past using it */
+  struct live_session *next;
+};
+static pthread_mutex_t g_live_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct live_session *g_live = NULL;
+static int g_live_count = 0;
+
 /* Per-session state threaded through the libssh callbacks. */
 struct session_state {
   int authenticated;
@@ -238,8 +254,39 @@ static ssh_channel channel_open_cb(ssh_session session, void *userdata) {
 
 /* --- per-connection handler ------------------------------------------- */
 
+static void live_add(struct live_session *ls) {
+  pthread_mutex_lock(&g_live_mu);
+  ls->next = g_live;
+  g_live = ls;
+  g_live_count++;
+  pthread_mutex_unlock(&g_live_mu);
+}
+
+/* The session's socket is about to be closed: stand-down must not shut the
+ * descriptor down any more (the number may be reused). */
+static void live_forget_fd(struct live_session *ls) {
+  pthread_mutex_lock(&g_live_mu);
+  ls->fd = -1;
+  pthread_mutex_unlock(&g_live_mu);
+}
+
+/* Last step of a session thread: it no longer touches libssh. */
+static void live_remove(struct live_session *ls) {
+  pthread_mutex_lock(&g_live_mu);
+  for (struct live_session **p = &g_live; *p != NULL; p = &(*p)->next) {
+    if (*p == ls) {
+      *p = ls->next;
+      g_live_count--;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_live_mu);
+  free(ls);
+}
+
 static void *handle_session(void *arg) {
-  ssh_session session = (ssh_session)arg;
+  struct live_session *live = (struct live_session *)arg;
+  ssh_session session = live->session;
   struct session_state st;
   memset(&st, 0, sizeof(st));
 
@@ -325,8 +372,10 @@ static void *handle_session(void *arg) {
   ssh_event_free(event);
 
 done:
+  live_forget_fd(live);
   ssh_disconnect(session);
   ssh_free(session);
+  live_remove(live);
   return NULL;
 }
 
@@ -385,6 +434,38 @@ static void local_ip(char *out, size_t n) {
 
 void ssh_server_request_stop(void) {
   g_running = 0;
+}
+
+/* A replacement payload waits 5 s for this process to exit before it gives
+ * up (instance_control.c), so stand-down waits less than that. */
+#ifndef ZSSHD_STANDDOWN_WAIT_S
+#define ZSSHD_STANDDOWN_WAIT_S 3
+#endif
+
+/* End the running sessions and wait for their threads; the accept loop has
+ * stopped, so no new ones start. shutdown() makes a thread blocked in the key
+ * exchange or a poll return at once with an error; a logged-in session also
+ * sees g_running clear. Returns the number of threads still running after
+ * ZSSHD_STANDDOWN_WAIT_S. */
+static int sessions_stand_down(void) {
+  pthread_mutex_lock(&g_live_mu);
+  int n = g_live_count;
+  if (n > 0) {
+    printf("[zsshd] Stand-down: ending %d session(s)\n", n);
+    for (struct live_session *ls = g_live; ls != NULL; ls = ls->next) {
+      if (ls->fd >= 0) {
+        (void)shutdown(ls->fd, SHUT_RDWR);
+      }
+    }
+  }
+  pthread_mutex_unlock(&g_live_mu);
+  for (int i = 0; n > 0 && i < ZSSHD_STANDDOWN_WAIT_S * 20; i++) {
+    usleep(50000);
+    pthread_mutex_lock(&g_live_mu);
+    n = g_live_count;
+    pthread_mutex_unlock(&g_live_mu);
+  }
+  return n;
 }
 
 int ssh_server_run(void) {
@@ -478,6 +559,18 @@ int ssh_server_run(void) {
       continue;
     }
 
+    struct live_session *live = malloc(sizeof(*live));
+    if (live == NULL) {
+      ssh_disconnect(session);
+      ssh_free(session);
+      continue;
+    }
+    live->session = session;
+    live->fd = ssh_get_fd(session);
+    /* Counted before the thread exists, so a stand-down right after this
+     * accept still waits for it. */
+    live_add(live);
+
     pthread_t t;
     pthread_attr_t attr;
     int have_attr = (pthread_attr_init(&attr) == 0);
@@ -489,17 +582,34 @@ int ssh_server_run(void) {
       (void)pthread_attr_setstacksize(&attr, 1024 * 1024);
     }
     if (pthread_create(&t, have_attr ? &attr : NULL, handle_session,
-                       session) != 0) {
+                       live) != 0) {
+      live_forget_fd(live);
       ssh_disconnect(session);
       ssh_free(session);
+      live_remove(live);
     }
     if (have_attr) {
       (void)pthread_attr_destroy(&attr);
     }
   }
 
+  /* Stand-down order: (1) stop accepting (the loop above has ended; close
+   * the listener), (2) end the running sessions and wait for their threads,
+   * (3) only then free libssh's shared crypto state. A session the loop
+   * accepted just before the stop request starts its key exchange after
+   * this point, and the process exit that follows our return runs libssh's
+   * destructor, which frees the RNG as ssh_finalize() does; a session thread
+   * still running at either moment draws from a freed RNG. */
   ssh_bind_free(g_bind);
   g_bind = NULL;
+  int left = sessions_stand_down();
+  if (left > 0) {
+    /* Still better than freeing the RNG under them now; process exit may. */
+    printf("[zsshd] Stand-down: %d session(s) did not end in %d s; "
+           "libssh left initialised\n",
+           left, ZSSHD_STANDDOWN_WAIT_S);
+    return 0;
+  }
   ssh_finalize();
   return 0;
 }
