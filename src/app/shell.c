@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <strings.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -689,6 +690,33 @@ static int cmd_rmdir(int argc, char **argv, struct shell_ctx *ctx) {
   return rc;
 }
 
+/* Set path's atime and mtime to now. On the PS5, utimensat(path, NULL) was
+ * seen to leave the mtime unchanged, so on failure fall back to futimes on an
+ * opened fd (the call SFTP fsetstat uses there), then utimes. Returns 0, or
+ * -1 with errno from the first call that failed. */
+static int touch_set_times(const char *path) {
+  if (utimensat(AT_FDCWD, path, NULL, 0) == 0) {
+    return 0;
+  }
+  int err = errno;
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) {
+    fd = open(path, O_RDONLY);
+  }
+  if (fd >= 0) {
+    int r = futimes(fd, NULL);
+    close(fd);
+    if (r == 0) {
+      return 0;
+    }
+  }
+  if (utimes(path, NULL) == 0) {
+    return 0;
+  }
+  errno = err;
+  return -1;
+}
+
 static int cmd_touch(int argc, char **argv, struct shell_ctx *ctx) {
   if (argc < 2) {
     cerror(ctx, "touch: missing operand\n");
@@ -706,7 +734,11 @@ static int cmd_touch(int argc, char **argv, struct shell_ctx *ctx) {
       continue;
     }
     close(fd);
-    (void)utimensat(AT_FDCWD, path, NULL, 0);
+    if (touch_set_times(path) != 0) {
+      cerror(ctx, "touch: ");
+      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      rc = 1;
+    }
   }
   return rc;
 }
