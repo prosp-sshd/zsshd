@@ -60,6 +60,19 @@
 #define MAX_ENTRIES_NUM_IN_PACKET 50
 #define MAX_LONG_NAME_LEN 350
 
+/* zsshd: SFTP_NO_HARDLINKS makes the server never call link(): plain rename
+ * goes through rename(2) and hardlink@openssh.com is neither advertised nor
+ * handled. On the PS5 (__PROSPERO__, predefined by the payload SDK's clang)
+ * link() never made a name on the console, and the SDK libc's link() is a
+ * raw system call stub that returns a failure as a positive errno, which
+ * the code below read as success. Whether the console supports hard links
+ * at all is not known, so builds for it do without them. Define
+ * SFTP_NO_HARDLINKS to get the same on any other build (the host tests do,
+ * to cover this path). */
+#if defined(__PROSPERO__) && !defined(SFTP_NO_HARDLINKS)
+#define SFTP_NO_HARDLINKS 1
+#endif
+
 /**
  * @internal
  *
@@ -842,6 +855,15 @@ int sftp_reply_version(sftp_client_message client_msg)
         return -1;
     }
 
+#ifdef SFTP_NO_HARDLINKS
+    rc = ssh_buffer_pack(reply,
+                         "dssss",
+                         version,
+                         "posix-rename@openssh.com",
+                         "1",
+                         "statvfs@openssh.com",
+                         "2");
+#else
     rc = ssh_buffer_pack(reply,
                          "dssssss",
                          version,
@@ -851,6 +873,7 @@ int sftp_reply_version(sftp_client_message client_msg)
                          "1",
                          "statvfs@openssh.com",
                          "2");
+#endif
     if (rc != SSH_OK) {
         ssh_set_error_oom(session);
         SSH_BUFFER_FREE(reply);
@@ -1086,7 +1109,9 @@ SSH_SFTP_CALLBACK(process_rename);
 SSH_SFTP_CALLBACK(process_fstat);
 SSH_SFTP_CALLBACK(process_fsetstat);
 SSH_SFTP_CALLBACK(process_extended_posix_rename);
+#ifndef SFTP_NO_HARDLINKS
 SSH_SFTP_CALLBACK(process_extended_hardlink);
+#endif
 
 const struct sftp_message_handler message_handlers[] = {
     {"open", NULL, SSH_FXP_OPEN, process_open},
@@ -1115,7 +1140,10 @@ const struct sftp_message_handler extended_handlers[] = {
     /* here are some extended type handlers */
     {"statvfs", "statvfs@openssh.com", 0, process_extended_statvfs},
     {"posix-rename", "posix-rename@openssh.com", 0, process_extended_posix_rename},
+#ifndef SFTP_NO_HARDLINKS
+    /* without it, process_extended() answers SSH_FX_OP_UNSUPPORTED */
     {"hardlink", "hardlink@openssh.com", 0, process_extended_hardlink},
+#endif
     {NULL, NULL, 0, NULL},
 };
 
@@ -1953,8 +1981,10 @@ handle_fd(sftp_client_message client_msg)
     return -1;
 }
 
-/* Some filesystems (the PS5's /data) answer link() with 0 but create no new
- * name. Trust a link only once newpath is the same file as oldpath. */
+#ifndef SFTP_NO_HARDLINKS
+/* A link() that reports success without creating newpath must not lead to
+ * oldpath being unlinked. Trust a link only once newpath is the same file
+ * as oldpath. */
 static int
 link_verified(const char *oldpath, const char *newpath)
 {
@@ -1963,6 +1993,7 @@ link_verified(const char *oldpath, const char *newpath)
     return lstat(oldpath, &so) == 0 && lstat(newpath, &sn) == 0 &&
            so.st_dev == sn.st_dev && so.st_ino == sn.st_ino;
 }
+#endif
 
 /* SSH_FXP_RENAME (draft-ietf-secsh-filexfer-02): it is an error if newpath
  * exists. As OpenSSH: a regular file is moved by link() + unlink(), so an
@@ -1970,8 +2001,12 @@ link_verified(const char *oldpath, const char *newpath)
  * fall back to rename() when newpath does not exist. oldpath is unlinked
  * only after link_verified(); a link() that reported success without
  * creating newpath also falls back to rename() when newpath does not exist,
- * and fails otherwise. Use the posix-rename@openssh.com extension to
- * replace a file in one step. */
+ * and fails otherwise. With SFTP_NO_HARDLINKS link() is never called:
+ * newpath is checked with lstat() and the file moved with rename(). That
+ * leaves a window between the two in which a file created at newpath by
+ * someone else would be replaced; link() is what closes it, and it cannot
+ * be trusted there. Use the posix-rename@openssh.com extension to replace
+ * a file in one step. */
 static int
 process_rename(sftp_client_message client_msg)
 {
@@ -1990,6 +2025,7 @@ process_rename(sftp_client_message client_msg)
 
     if (lstat(oldpath, &st) < 0) {
         status = unix_errno_to_ssh_stat(errno);
+#ifndef SFTP_NO_HARDLINKS
     } else if (S_ISREG(st.st_mode)) {
         if (link(oldpath, newpath) < 0) {
             int e = errno;
@@ -2014,6 +2050,7 @@ process_rename(sftp_client_message client_msg)
             status = unix_errno_to_ssh_stat(errno);
             (void)unlink(newpath); /* undo the link */
         }
+#endif
     } else if (lstat(newpath, &st_new) == 0) {
         status = SSH_FX_FAILURE; /* target exists */
     } else if (rename(oldpath, newpath) < 0) {
@@ -2045,6 +2082,7 @@ process_extended_posix_rename(sftp_client_message client_msg)
     return SSH_OK;
 }
 
+#ifndef SFTP_NO_HARDLINKS
 /* hardlink@openssh.com: link(2). */
 static int
 process_extended_hardlink(sftp_client_message client_msg)
@@ -2071,6 +2109,7 @@ process_extended_hardlink(sftp_client_message client_msg)
     reply_errno_status(client_msg, rv, errno);
     return SSH_OK;
 }
+#endif /* SFTP_NO_HARDLINKS */
 
 static int
 process_fstat(sftp_client_message client_msg)
