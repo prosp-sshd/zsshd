@@ -182,12 +182,12 @@ scp ./file root@<ps5-ip>:/data/dir/
 - **SFTP server: libssh 0.12's default server, patched.** libssh's own
   server answers `rename`, `fstat` and `fsetstat` with "Operation unsupported";
   zsshd's vendored copy (`external/libssh-0.12.2/src/sftpserver.c`) implements
-  them, plus the `posix-rename@openssh.com` and `hardlink@openssh.com`
-  extensions it already advertised. So `scp` and `sftp put -p` keep mode and
-  times with no `fsetstat` warning, and `sftp`'s `rename` works: OpenSSH's
-  client sends `posix-rename`, which replaces an existing target in one step
-  (`rename(2)`); the plain SFTP v3 `rename` refuses an existing target, as
-  OpenSSH's server does.
+  them, plus the `posix-rename@openssh.com` extension it already advertised.
+  So `scp` and `sftp put -p` keep mode and times with no `fsetstat` warning,
+  and `sftp`'s `rename` works: OpenSSH's client sends `posix-rename`, which
+  replaces an existing target in one step (`rename(2)`); the plain SFTP v3
+  `rename` refuses an existing target, as OpenSSH's server does. Hard links
+  (`sftp`'s `ln`) are not supported.
 
 ## Versioning
 
