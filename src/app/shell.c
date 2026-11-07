@@ -47,6 +47,7 @@ struct shell_ctx {
   int interactive;
   int rows;
   int out_fd; /* >=0 => redirect command stdout to this fd */
+  int err_fd; /* >=0 => redirect command stderr to this fd */
   const char *in_buf; /* stdin source for < and pipes; NULL = none */
   size_t in_len;
   char (*history)[HIST_LINE];
@@ -110,13 +111,18 @@ static void cprintf(struct shell_ctx *ctx, const char *fmt, ...) {
 }
 
 static void cerror(struct shell_ctx *ctx, const char *fmt, ...) {
-  char buf[1024];
+  char buf[2048];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
+  if (ctx->err_fd >= 0) {
+    ssize_t wr = write(ctx->err_fd, buf, strlen(buf)); /* file: raw */
+    (void)wr;
+    return;
+  }
   int saved = ctx->out_fd;
-  ctx->out_fd = -1; /* errors go to the terminal, not a redirect target */
+  ctx->out_fd = -1; /* errors go to the terminal, not stdout's target */
   ccolor(ctx, C_ERR);
   cputs(ctx, buf);
   ccolor(ctx, C_RESET);
@@ -193,13 +199,11 @@ static int cmd_cd(int argc, char **argv, struct shell_ctx *ctx) {
   resolve_path(ctx, target, path, sizeof(path));
   struct stat sb;
   if (stat(path, &sb) != 0) {
-    cerror(ctx, "cd: ");
-    cprintf(ctx, "%s: no such file or directory\n", target);
+    cerror(ctx, "cd: %s: no such file or directory\n", target);
     return 1;
   }
   if (!S_ISDIR(sb.st_mode)) {
-    cerror(ctx, "cd: ");
-    cprintf(ctx, "%s: not a directory\n", target);
+    cerror(ctx, "cd: %s: not a directory\n", target);
     return 1;
   }
   snprintf(ctx->cwd, sizeof(ctx->cwd), "%s", path);
@@ -219,9 +223,8 @@ static int cmd_ls(int argc, char **argv, struct shell_ctx *ctx) {
 
   struct stat sb;
   if (stat(path, &sb) != 0) {
-    cerror(ctx, "ls: ");
-    cprintf(ctx, "%s: no such file or directory\n",
-            (argc > 1) ? argv[1] : ctx->cwd);
+    cerror(ctx, "ls: %s: no such file or directory\n",
+           (argc > 1) ? argv[1] : ctx->cwd);
     return 1;
   }
 
@@ -238,8 +241,7 @@ static int cmd_ls(int argc, char **argv, struct shell_ctx *ctx) {
     DIR *d = opendir(path);
     if (!d) {
       free(names);
-      cerror(ctx, "ls: ");
-      cprintf(ctx, "%s: cannot open\n", path);
+      cerror(ctx, "ls: %s: cannot open\n", path);
       return 1;
     }
     struct dirent *e;
@@ -457,8 +459,7 @@ static int cmd_cat(int argc, char **argv, struct shell_ctx *ctx) {
     resolve_path(ctx, argv[a], path, sizeof(path));
     FILE *f = fopen(path, "rb");
     if (!f) {
-      cerror(ctx, "cat: ");
-      cprintf(ctx, "%s: cannot open\n", argv[a]);
+      cerror(ctx, "cat: %s: cannot open\n", argv[a]);
       rc = 1;
       continue;
     }
@@ -664,8 +665,7 @@ static int cmd_mkdir(int argc, char **argv, struct shell_ctx *ctx) {
     resolve_path(ctx, argv[a], path, sizeof(path));
     int r = parents ? mkdir_p(path) : mkdir(path, 0755);
     if (r != 0) {
-      cerror(ctx, "mkdir: ");
-      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      cerror(ctx, "mkdir: %s: %s\n", argv[a], strerror(errno));
       rc = 1;
     }
   }
@@ -682,8 +682,7 @@ static int cmd_rmdir(int argc, char **argv, struct shell_ctx *ctx) {
     char path[PATH_MAX];
     resolve_path(ctx, argv[a], path, sizeof(path));
     if (rmdir(path) != 0) {
-      cerror(ctx, "rmdir: ");
-      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      cerror(ctx, "rmdir: %s: %s\n", argv[a], strerror(errno));
       rc = 1;
     }
   }
@@ -701,8 +700,7 @@ static int cmd_touch(int argc, char **argv, struct shell_ctx *ctx) {
     resolve_path(ctx, argv[a], path, sizeof(path));
     int fd = open(path, O_WRONLY | O_CREAT, 0644);
     if (fd < 0) {
-      cerror(ctx, "touch: ");
-      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      cerror(ctx, "touch: %s: %s\n", argv[a], strerror(errno));
       rc = 1;
       continue;
     }
@@ -740,28 +738,24 @@ static int cmd_rm(int argc, char **argv, struct shell_ctx *ctx) {
     struct stat st;
     if (stat(path, &st) != 0) {
       if (!force) {
-        cerror(ctx, "rm: ");
-        cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+        cerror(ctx, "rm: %s: %s\n", argv[a], strerror(errno));
         rc = 1;
       }
       continue;
     }
     if (S_ISDIR(st.st_mode)) {
       if (!recursive) {
-        cerror(ctx, "rm: ");
-        cprintf(ctx, "%s: is a directory\n", argv[a]);
+        cerror(ctx, "rm: %s: is a directory\n", argv[a]);
         rc = 1;
         continue;
       }
       if (remove_recursive(path) != 0 && !force) {
-        cerror(ctx, "rm: ");
-        cprintf(ctx, "%s: failed to remove\n", argv[a]);
+        cerror(ctx, "rm: %s: failed to remove\n", argv[a]);
         rc = 1;
       }
     } else {
       if (unlink(path) != 0 && !force) {
-        cerror(ctx, "rm: ");
-        cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+        cerror(ctx, "rm: %s: %s\n", argv[a], strerror(errno));
         rc = 1;
       }
     }
@@ -800,8 +794,7 @@ static int cmd_cp(int argc, char **argv, struct shell_ctx *ctx) {
     resolve_path(ctx, argv[a], src, sizeof(src));
     struct stat st;
     if (stat(src, &st) != 0) {
-      cerror(ctx, "cp: ");
-      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      cerror(ctx, "cp: %s: %s\n", argv[a], strerror(errno));
       rc = 1;
       continue;
     }
@@ -813,20 +806,17 @@ static int cmd_cp(int argc, char **argv, struct shell_ctx *ctx) {
     }
     if (S_ISDIR(st.st_mode)) {
       if (!recursive) {
-        cerror(ctx, "cp: ");
-        cprintf(ctx, "%s: is a directory (use -r)\n", argv[a]);
+        cerror(ctx, "cp: %s: is a directory (use -r)\n", argv[a]);
         rc = 1;
         continue;
       }
       if (copy_recursive(src, target) != 0) {
-        cerror(ctx, "cp: ");
-        cprintf(ctx, "%s: copy failed\n", argv[a]);
+        cerror(ctx, "cp: %s: copy failed\n", argv[a]);
         rc = 1;
       }
     } else {
       if (copy_file(src, target) != 0) {
-        cerror(ctx, "cp: ");
-        cprintf(ctx, "%s: copy failed\n", argv[a]);
+        cerror(ctx, "cp: %s: copy failed\n", argv[a]);
         rc = 1;
       }
     }
@@ -864,21 +854,18 @@ static int cmd_mv(int argc, char **argv, struct shell_ctx *ctx) {
       /* cross-device move: copy then remove the source */
       struct stat st;
       if (stat(src, &st) != 0) {
-        cerror(ctx, "mv: ");
-        cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+        cerror(ctx, "mv: %s: %s\n", argv[a], strerror(errno));
         rc = 1;
         continue;
       }
       int cr = S_ISDIR(st.st_mode) ? copy_recursive(src, target)
                                    : copy_file(src, target);
       if (cr != 0 || remove_recursive(src) != 0) {
-        cerror(ctx, "mv: ");
-        cprintf(ctx, "%s: move failed\n", argv[a]);
+        cerror(ctx, "mv: %s: move failed\n", argv[a]);
         rc = 1;
       }
     } else {
-      cerror(ctx, "mv: ");
-      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      cerror(ctx, "mv: %s: %s\n", argv[a], strerror(errno));
       rc = 1;
     }
   }
@@ -929,8 +916,7 @@ static int cmd_head(int argc, char **argv, struct shell_ctx *ctx) {
     resolve_path(ctx, argv[a], path, sizeof(path));
     FILE *f = fopen(path, "r");
     if (!f) {
-      cerror(ctx, "head: ");
-      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      cerror(ctx, "head: %s: %s\n", argv[a], strerror(errno));
       rc = 1;
       continue;
     }
@@ -1000,8 +986,7 @@ static int cmd_tail(int argc, char **argv, struct shell_ctx *ctx) {
     resolve_path(ctx, argv[a], path, sizeof(path));
     FILE *f = fopen(path, "r");
     if (!f) {
-      cerror(ctx, "tail: ");
-      cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+      cerror(ctx, "tail: %s: %s\n", argv[a], strerror(errno));
       rc = 1;
       continue;
     }
@@ -1083,8 +1068,7 @@ static int cmd_grep(int argc, char **argv, struct shell_ctx *ctx) {
       resolve_path(ctx, argv[a], path, sizeof(path));
       FILE *f = fopen(path, "r");
       if (!f) {
-        cerror(ctx, "grep: ");
-        cprintf(ctx, "%s: %s\n", argv[a], strerror(errno));
+        cerror(ctx, "grep: %s: %s\n", argv[a], strerror(errno));
         continue;
       }
       struct instream in;
@@ -1112,8 +1096,7 @@ static int cmd_pager(int argc, char **argv, struct shell_ctx *ctx) {
     resolve_path(ctx, argv[a], path, sizeof(path));
     FILE *f = fopen(path, "r");
     if (!f) {
-      cerror(ctx, "less: ");
-      cprintf(ctx, "%s: cannot open\n", argv[a]);
+      cerror(ctx, "less: %s: cannot open\n", argv[a]);
       rc = 1;
       continue;
     }
@@ -1271,8 +1254,7 @@ static int cmd_kill(int argc, char **argv, struct shell_ctx *ctx) {
     }
     sig = sig_from_token(spec);
     if (sig < 0) {
-      cerror(ctx, "kill: ");
-      cprintf(ctx, "%s: invalid signal\n", spec);
+      cerror(ctx, "kill: %s: invalid signal\n", spec);
       return 1;
     }
   }
@@ -1285,14 +1267,12 @@ static int cmd_kill(int argc, char **argv, struct shell_ctx *ctx) {
     char *end = NULL;
     long pid = strtol(argv[a], &end, 10);
     if (end == argv[a] || *end != '\0') {
-      cerror(ctx, "kill: ");
-      cprintf(ctx, "%s: arguments must be process IDs\n", argv[a]);
+      cerror(ctx, "kill: %s: arguments must be process IDs\n", argv[a]);
       rc = 1;
       continue;
     }
     if (kill((pid_t)pid, sig) != 0) {
-      cerror(ctx, "kill: ");
-      cprintf(ctx, "(%ld): %s\n", pid, strerror(errno));
+      cerror(ctx, "kill: (%ld): %s\n", pid, strerror(errno));
       rc = 1;
     }
   }
@@ -1331,16 +1311,62 @@ static int cmd_help(int argc, char **argv, struct shell_ctx *ctx) {
 
 /* --- line parsing + loop ----------------------------------------------- */
 
+/* Read everything left on fd into a malloc'd buffer (caller frees); NULL on
+ * error. */
+static char *read_fd_all(int fd, size_t *outlen) {
+  size_t cap = 8192, len = 0;
+  char *b = malloc(cap);
+  if (!b) {
+    return NULL;
+  }
+  for (;;) {
+    if (len == cap) {
+      char *nb = realloc(b, cap * 2);
+      if (!nb) {
+        free(b);
+        return NULL;
+      }
+      b = nb;
+      cap *= 2;
+    }
+    ssize_t n = read(fd, b + len, cap - len);
+    if (n < 0) {
+      free(b);
+      return NULL;
+    }
+    if (n == 0) {
+      break;
+    }
+    len += (size_t)n;
+  }
+  *outlen = len;
+  return b;
+}
+
+/* The fd an output descriptor writes to after redirection: a file opened for
+ * it, or what the command started with (base[]; -1 is the terminal). */
+static int redir_target(const struct cmdline_fd *f, const int *opened,
+                        const int *base) {
+  if (f->file >= 0) {
+    return opened[f->file];
+  }
+  return f->orig >= 0 ? base[f->orig] : -1;
+}
+
 static int dispatch_one(struct shell_ctx *ctx, char *line) {
   char *argv[MAX_ARGS];
   struct cmdline_redir r;
+  struct cmdline_fd fds[CMDLINE_NFD];
   const char *err = NULL;
   int argc = cmdline_parse(line, argv, MAX_ARGS, &r, &err);
+  if (argc >= 0 && cmdline_route(&r, fds, &err) != 0) {
+    argc = -1;
+  }
   if (argc < 0) {
     cerror(ctx, "%s\n", err);
     return 1;
   }
-  if (argc == 0 && !r.out_path && !r.in_path) {
+  if (argc == 0 && r.n == 0) {
     return 0;
   }
   if (argc == 0) {
@@ -1348,43 +1374,57 @@ static int dispatch_one(struct shell_ctx *ctx, char *line) {
     return 1;
   }
 
-  const char *saved_in_buf = ctx->in_buf;
-  size_t saved_in_len = ctx->in_len;
-  char *in_data = NULL;
-  int redirected_out = 0, saved_color = ctx->color;
-
-  if (r.in_path) {
-    char path[PATH_MAX];
-    resolve_path(ctx, r.in_path, path, sizeof(path));
-    size_t len = 0;
-    in_data = read_file_all(path, &len);
-    if (!in_data) {
-      cerror(ctx, "cannot open ");
-      cprintf(ctx, "%s: %s\n", r.in_path, strerror(errno));
-      return 1;
+  /* Open every file in the order written, as sh does ("> a > b" creates
+   * both); fds[] says which of them each of 0-2 ends up on. */
+  int opened[CMDLINE_MAX_REDIR];
+  for (int i = 0; i < r.n; i++) {
+    const struct cmdline_redir_op *o = &r.op[i];
+    opened[i] = -1;
+    if (o->kind == CMDLINE_DUP) {
+      continue;
     }
-    ctx->in_buf = in_data;
-    ctx->in_len = len;
-  }
-
-  if (r.out_path) {
     char path[PATH_MAX];
-    resolve_path(ctx, r.out_path, path, sizeof(path));
-    int flags = O_WRONLY | O_CREAT | (r.append ? O_APPEND : O_TRUNC);
-    int fd = open(path, flags, 0644);
-    if (fd < 0) {
-      cerror(ctx, "cannot open ");
-      cprintf(ctx, "%s: %s\n", r.out_path, strerror(errno));
-      if (in_data) {
-        free(in_data);
-        ctx->in_buf = saved_in_buf;
-        ctx->in_len = saved_in_len;
+    resolve_path(ctx, o->path, path, sizeof(path));
+    int flags = O_RDONLY;
+    if (o->kind == CMDLINE_OUT) {
+      flags = O_WRONLY | O_CREAT | O_TRUNC;
+    } else if (o->kind == CMDLINE_APPEND) {
+      flags = O_WRONLY | O_CREAT | O_APPEND;
+    }
+    opened[i] = open(path, flags, 0644);
+    if (opened[i] < 0) {
+      cerror(ctx, "cannot open %s: %s\n", o->path, strerror(errno));
+      for (int j = 0; j < i; j++) {
+        if (opened[j] >= 0) {
+          close(opened[j]);
+        }
       }
       return 1;
     }
-    ctx->out_fd = fd;
+  }
+
+  const char *saved_in_buf = ctx->in_buf;
+  size_t saved_in_len = ctx->in_len;
+  int saved_out = ctx->out_fd, saved_err = ctx->err_fd;
+  int saved_color = ctx->color;
+  char *in_data = NULL;
+
+  /* stdin: a file is read whole; the terminal (NULL) when 0 is a copy of 1
+   * or 2; unchanged when it was not redirected. */
+  if (fds[0].file >= 0) {
+    size_t len = 0;
+    in_data = read_fd_all(opened[fds[0].file], &len);
+    ctx->in_buf = in_data ? in_data : "";
+    ctx->in_len = in_data ? len : 0;
+  } else if (fds[0].orig != 0) {
+    ctx->in_buf = NULL;
+    ctx->in_len = 0;
+  }
+  int base[3] = {-1, saved_out, saved_err};
+  ctx->out_fd = redir_target(&fds[1], opened, base);
+  ctx->err_fd = redir_target(&fds[2], opened, base);
+  if (ctx->out_fd >= 0) {
     ctx->color = 0; /* no colour escapes in a file */
-    redirected_out = 1;
   }
 
   int status = 127, found = 0;
@@ -1400,16 +1440,17 @@ static int dispatch_one(struct shell_ctx *ctx, char *line) {
     status = 127;
   }
 
-  if (redirected_out) {
-    close(ctx->out_fd);
-    ctx->out_fd = -1;
-    ctx->color = saved_color;
+  for (int i = 0; i < r.n; i++) {
+    if (opened[i] >= 0) {
+      close(opened[i]);
+    }
   }
-  if (in_data) {
-    free(in_data);
-    ctx->in_buf = saved_in_buf;
-    ctx->in_len = saved_in_len;
-  }
+  ctx->out_fd = saved_out;
+  ctx->err_fd = saved_err;
+  ctx->color = saved_color;
+  free(in_data);
+  ctx->in_buf = saved_in_buf;
+  ctx->in_len = saved_in_len;
   return status;
 }
 
@@ -1433,9 +1474,19 @@ static int run_pipeline(struct shell_ctx *ctx, char **cmds, int n) {
       char tmp[PATH_MAX];
       snprintf(tmp, sizeof(tmp), "/data/zsshd/.pipe.%lx.%d",
                (unsigned long)(uintptr_t)ctx, i);
-      char linebuf[LINE_MAX_LEN];
-      snprintf(linebuf, sizeof(linebuf), "%s > %s", cmds[i], tmp);
-      status = dispatch_one(ctx, linebuf);
+      /* The temp file is the stage's stdout before its own redirections,
+       * as a pipe is in sh, so "cmd 2>&1 | ..." sends errors down it too. */
+      int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd < 0) {
+        cerror(ctx, "cannot open %s: %s\n", tmp, strerror(errno));
+        status = 1;
+      } else {
+        int saved_out = ctx->out_fd;
+        ctx->out_fd = fd;
+        status = dispatch_one(ctx, cmds[i]);
+        ctx->out_fd = saved_out;
+        close(fd);
+      }
       free(carry);
       carry = read_file_all(tmp, &carry_len);
       (void)unlink(tmp);
@@ -1751,6 +1802,7 @@ void shell_run(ssh_channel channel, int interactive, int rows) {
   ctx.interactive = interactive;
   ctx.rows = rows;
   ctx.out_fd = -1;
+  ctx.err_fd = -1;
   ctx.in_buf = NULL;
   ctx.in_len = 0;
 
@@ -1924,6 +1976,7 @@ int shell_exec(ssh_channel channel, const char *command) {
   ctx.interactive = 0;
   ctx.rows = 0;
   ctx.out_fd = -1;
+  ctx.err_fd = -1;
   ctx.in_buf = NULL;
   ctx.in_len = 0;
   snprintf(ctx.cwd, sizeof(ctx.cwd), "/");

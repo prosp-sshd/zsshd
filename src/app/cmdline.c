@@ -112,13 +112,69 @@ static char *scan_word(struct scan *s, int *quoted, const char **err) {
   return word;
 }
 
+#define NO_FILE "syntax error: expected filename after redirection"
+#define BAD_FD "syntax error: bad file descriptor number"
+
+/* The single-digit descriptor in `w`, or -1. */
+static int fd_number(const char *w) {
+  return is_number(w) && w[1] == '\0' ? w[0] - '0' : -1;
+}
+
+/* Read the rest of a redirection whose operator character `op` ('<' or '>')
+ * was just consumed: an optional second '>' or '&', then the file name or
+ * descriptor. `fd` is the number glued before the operator, or -1. */
+static int scan_redir(struct scan *s, char op, int fd, struct cmdline_redir *r,
+                      const char **err) {
+  struct cmdline_redir_op o;
+  o.kind = op == '<' ? CMDLINE_IN : CMDLINE_OUT;
+  o.fd = fd >= 0 ? fd : (op == '<' ? 0 : 1);
+  o.path = NULL;
+  o.dup_fd = -1;
+  if (op == '>' && *s->r == '>') {
+    o.kind = CMDLINE_APPEND;
+    s->r++;
+  } else if (*s->r == '&') {
+    o.kind = CMDLINE_DUP;
+    s->r++;
+  }
+  while (is_blank(*s->r)) {
+    s->r++;
+  }
+  if (*s->r == '\0' || is_redir(*s->r)) {
+    *err = o.kind == CMDLINE_DUP ? BAD_FD : NO_FILE;
+    return -1;
+  }
+  int quoted;
+  char *word = scan_word(s, &quoted, err);
+  if (word == NULL) {
+    return -1;
+  }
+  if (o.kind == CMDLINE_DUP) {
+    o.dup_fd = fd_number(word);
+    if (o.dup_fd < 0) {
+      *err = BAD_FD;
+      return -1;
+    }
+  } else if (*word == '\0') {
+    *err = NO_FILE;
+    return -1;
+  } else {
+    o.path = word;
+  }
+  if (r->n >= CMDLINE_MAX_REDIR) {
+    *err = "syntax error: too many redirections";
+    return -1;
+  }
+  r->op[r->n++] = o;
+  return 0;
+}
+
 int cmdline_parse(char *line, char **argv, int max, struct cmdline_redir *r,
                   const char **err) {
   struct scan s = {line, line, '\0'};
   int argc = 0;
-  r->out_path = NULL;
-  r->append = 0;
-  r->in_path = NULL;
+  int fd = -1; /* descriptor number glued to the pending operator */
+  r->n = 0;
   for (;;) {
     char op = s.pend;
     s.pend = '\0';
@@ -133,50 +189,55 @@ int cmdline_parse(char *line, char **argv, int max, struct cmdline_redir *r,
         op = *s.r++;
       }
     }
-    int quoted;
     if (op != '\0') {
-      int append = 0;
-      if (op == '>' && *s.r == '>') {
-        append = 1;
-        s.r++;
-      }
-      while (is_blank(*s.r)) {
-        s.r++;
-      }
-      if (*s.r == '\0' || is_redir(*s.r)) {
-        *err = "syntax error: expected filename after redirection";
+      if (scan_redir(&s, op, fd, r, err) != 0) {
         return -1;
       }
-      char *path = scan_word(&s, &quoted, err);
-      if (path == NULL) {
-        return -1;
-      }
-      if (*path == '\0') {
-        *err = "syntax error: expected filename after redirection";
-        return -1;
-      }
-      if (op == '<') {
-        r->in_path = path;
-      } else {
-        r->out_path = path;
-        r->append = append;
-      }
+      fd = -1;
       continue;
     }
+    int quoted;
     char *word = scan_word(&s, &quoted, err);
     if (word == NULL) {
       return -1;
     }
-    /* "2>f": an unquoted all-digit word glued to an operator names a file
-     * descriptor in a full shell. Not supported; refuse rather than silently
-     * pass "2" as an argument. */
+    /* "2>f": an unquoted all-digit word glued to an operator names the
+     * descriptor the operator redirects. */
     if (!quoted && s.pend != '\0' && is_number(word)) {
-      *err = "syntax error: file descriptor redirection is not supported";
-      return -1;
+      fd = fd_number(word);
+      if (fd < 0) {
+        *err = BAD_FD;
+        return -1;
+      }
+      s.w = word; /* not a word: drop it from the compacted line */
+      continue;
     }
     if (argc < max) {
       argv[argc++] = word;
     }
   }
   return argc;
+}
+
+int cmdline_route(const struct cmdline_redir *r, struct cmdline_fd *fds,
+                  const char **err) {
+  for (int i = 0; i < CMDLINE_NFD; i++) {
+    fds[i].file = -1;
+    fds[i].orig = i <= 2 ? i : -1;
+  }
+  for (int i = 0; i < r->n; i++) {
+    const struct cmdline_redir_op *o = &r->op[i];
+    if (o->kind == CMDLINE_DUP) {
+      struct cmdline_fd src = fds[o->dup_fd];
+      if (src.file < 0 && src.orig < 0) {
+        *err = "redirection: bad file descriptor";
+        return -1;
+      }
+      fds[o->fd] = src;
+    } else {
+      fds[o->fd].file = i;
+      fds[o->fd].orig = -1;
+    }
+  }
+  return 0;
 }
