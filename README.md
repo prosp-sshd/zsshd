@@ -196,15 +196,15 @@ scp ./file root@<ps5-ip>:/data/dir/
   channel; for bulk transfers the plaintext [`zftpd`](https://github.com/seregonwar/zftpd)
   payload is faster. zsshd's SFTP is the secure/convenient option. The server
   prefers hardware-accelerated AES-GCM to keep it reasonable.
-- **Built-in SFTP server gaps (libssh 0.12 default server).** Upload, download,
-  directory listing, `mkdir`/`rmdir`/`remove`, `stat`/`lstat`,
-  `symlink`/`readlink` and `realpath` all work. `rename`, `fsetstat` and `fstat`
-  are not implemented by libssh's default server, so:
-  - `scp` prints a harmless `remote fsetstat: Operation unsupported` after an
-    upload. The file transfers correctly; only mode/timestamp preservation is
-    skipped.
-  - Renaming over SFTP fails — rename via the shell instead:
-    `ssh root@<ps5-ip> 'mv old new'`.
+- **SFTP server: libssh 0.12's default server, patched.** libssh's own
+  server answers `rename`, `fstat` and `fsetstat` with "Operation unsupported";
+  zsshd's vendored copy (`external/libssh-0.12.2/src/sftpserver.c`) implements
+  them, plus the `posix-rename@openssh.com` extension it already advertised.
+  So `scp` and `sftp put -p` keep mode and times with no `fsetstat` warning,
+  and `sftp`'s `rename` works: OpenSSH's client sends `posix-rename`, which
+  replaces an existing target in one step (`rename(2)`); the plain SFTP v3
+  `rename` refuses an existing target, as OpenSSH's server does. Hard links
+  (`sftp`'s `ln`) are not supported.
 
 ## Host tests
 
