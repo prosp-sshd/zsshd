@@ -1,4 +1,5 @@
 #include "shell.h"
+#include "cmdline.h"
 #include "zsshd_version.h"
 
 #if defined(PLATFORM_PS5)
@@ -1330,79 +1331,17 @@ static int cmd_help(int argc, char **argv, struct shell_ctx *ctx) {
 
 /* --- line parsing + loop ----------------------------------------------- */
 
-static int tokenize(char *line, char **argv, int max) {
-  int argc = 0;
-  char *p = line;
-  while (*p && argc < max) {
-    while (*p == ' ' || *p == '\t') {
-      *p++ = '\0';
-    }
-    if (*p == '\0') {
-      break;
-    }
-    argv[argc++] = p;
-    while (*p && *p != ' ' && *p != '\t') {
-      p++;
-    }
-  }
-  return argc;
-}
-
-struct redir {
-  const char *out_path; /* non-NULL for > or >> */
-  int append;           /* 1 for >>, 0 for > */
-  const char *in_path;  /* non-NULL for < */
-};
-
-/* Strip '>' '>>' (output) and '<' (input) redirection tokens from argv,
- * filling *r. Each operator may be glued to its filename ('>f') or separate
- * ('>' 'f'). Returns 0 on success, -1 on an operator with no filename. */
-static int parse_redirect(char **argv, int *argc, struct redir *r) {
-  r->out_path = NULL;
-  r->append = 0;
-  r->in_path = NULL;
-  int w = 0;
-  for (int i = 0; i < *argc; i++) {
-    char *t = argv[i];
-    if (t[0] == '>') {
-      int app = (t[1] == '>');
-      const char *fname = t + (app ? 2 : 1);
-      if (*fname == '\0') {
-        if (i + 1 >= *argc) {
-          return -1;
-        }
-        fname = argv[++i];
-      }
-      r->out_path = fname;
-      r->append = app;
-    } else if (t[0] == '<') {
-      const char *fname = t + 1;
-      if (*fname == '\0') {
-        if (i + 1 >= *argc) {
-          return -1;
-        }
-        fname = argv[++i];
-      }
-      r->in_path = fname;
-    } else {
-      argv[w++] = t;
-    }
-  }
-  *argc = w;
-  return 0;
-}
-
 static int dispatch_one(struct shell_ctx *ctx, char *line) {
   char *argv[MAX_ARGS];
-  int argc = tokenize(line, argv, MAX_ARGS);
-  if (argc == 0) {
-    return 0;
-  }
-
-  struct redir r;
-  if (parse_redirect(argv, &argc, &r) != 0) {
-    cerror(ctx, "syntax error: expected filename after redirection\n");
+  struct cmdline_redir r;
+  const char *err = NULL;
+  int argc = cmdline_parse(line, argv, MAX_ARGS, &r, &err);
+  if (argc < 0) {
+    cerror(ctx, "%s\n", err);
     return 1;
+  }
+  if (argc == 0 && !r.out_path && !r.in_path) {
+    return 0;
   }
   if (argc == 0) {
     cerror(ctx, "syntax error: missing command before redirection\n");
@@ -1514,24 +1453,23 @@ static int run_pipeline(struct shell_ctx *ctx, char **cmds, int n) {
   return status;
 }
 
-/* Split a command segment on top-level '|'; run it as a pipeline, or as a
- * single command when there is no pipe. */
+/* Split a command segment on each unquoted '|'; run it as a pipeline, or as
+ * a single command when there is no pipe. */
 static int run_segment(struct shell_ctx *ctx, char *seg) {
   char *cmds[MAX_ARGS];
   int n = 0;
   char *start = seg;
-  for (char *p = seg;; p++) {
-    if (*p == '|' || *p == '\0') {
-      char end = *p;
-      *p = '\0';
-      if (n < MAX_ARGS) {
-        cmds[n++] = start;
-      }
-      if (end == '\0') {
-        break;
-      }
-      start = p + 1;
+  for (;;) {
+    char *p = cmdline_find_sep(start, "|");
+    char end = *p;
+    *p = '\0';
+    if (n < MAX_ARGS) {
+      cmds[n++] = start;
     }
+    if (end == '\0') {
+      break;
+    }
+    start = p + 1;
   }
   if (n <= 1) {
     return dispatch_one(ctx, seg);
@@ -1544,16 +1482,15 @@ static int run_commands(struct shell_ctx *ctx, const char *text) {
   snprintf(work, sizeof(work), "%s", text);
   int status = 0;
   char *seg = work;
-  for (char *p = work;; p++) {
-    if (*p == ';' || *p == '\n' || *p == '\0') {
-      char end = *p;
-      *p = '\0';
-      status = run_segment(ctx, seg);
-      if (end == '\0' || !ctx->running) {
-        break;
-      }
-      seg = p + 1;
+  for (;;) {
+    char *p = cmdline_find_sep(seg, ";\n");
+    char end = *p;
+    *p = '\0';
+    status = run_segment(ctx, seg);
+    if (end == '\0' || !ctx->running) {
+      break;
     }
+    seg = p + 1;
   }
   return status;
 }

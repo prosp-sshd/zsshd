@@ -26,6 +26,9 @@ other payloads/mods can automate against it.
   - `;` and newlines separate multiple commands.
   - Redirection: `cmd > file` (truncate), `cmd >> file` (append), `cmd < file` (stdin).
   - Pipes: `cmd1 | cmd2` feeds one built-in's output into the next (e.g. `ps | grep ...`).
+  - Quoting: `"..."`, `'...'` and `\` escapes, so paths with spaces work
+    (`cd "My Folder"`, `cat my\ file.txt`). A quoted or escaped `>`, `<`, `|`
+    or `;` is a literal character, not an operator.
 - Single-instance control: a new copy asks a running one to stand down.
 - On-screen toast on startup showing the listening `IP:port`.
 
@@ -89,6 +92,13 @@ Output: `zsshd.elf`.
 > **GEN_FILES:** `-DGEN_FILES=OFF` uses the generated files already present in
 > the 3.6.7 checkout. If your checkout is missing them, use `-DGEN_FILES=ON`
 > (requires Python 3 + `jinja2`).
+
+The shell's command-line parser (`src/app/cmdline.c`) is plain C with no PS5
+calls; its unit test runs on the host with any C compiler:
+
+```fish
+sh test/host/cmdline.sh
+```
 
 ## Deploying
 
