@@ -48,6 +48,7 @@ struct shell_ctx {
   int rows;
   int out_fd; /* >=0 => redirect command stdout to this fd */
   int err_fd; /* >=0 => redirect command stderr to this fd */
+  int wr_err; /* a write to a closed stdout ("cmd >&-") was dropped */
   const char *in_buf; /* stdin source for < and pipes; NULL = none */
   size_t in_len;
   char (*history)[HIST_LINE];
@@ -55,9 +56,17 @@ struct shell_ctx {
   int hist_pos;
 };
 
+/* out_fd / err_fd value for a descriptor closed with ">&-": writes to it are
+ * dropped (stdout's are counted in wr_err, which fails the command). */
+#define FD_CLOSED (-2)
+
 /* --- output helpers: translate bare \n to \r\n for the client PTY ------ */
 
 static void cout(struct shell_ctx *ctx, const char *s, size_t len) {
+  if (ctx->out_fd == FD_CLOSED) {
+    ctx->wr_err = 1;
+    return;
+  }
   if (ctx->out_fd >= 0) {
     ssize_t wr = write(ctx->out_fd, s, len); /* file: raw, no CRLF xlate */
     (void)wr;
@@ -84,6 +93,10 @@ static void cputs(struct shell_ctx *ctx, const char *s) {
 
 /* raw write, no newline translation (for escape sequences) */
 static void craw(struct shell_ctx *ctx, const char *s) {
+  if (ctx->out_fd == FD_CLOSED) {
+    ctx->wr_err = 1;
+    return;
+  }
   if (ctx->out_fd >= 0) {
     ssize_t wr = write(ctx->out_fd, s, strlen(s));
     (void)wr;
@@ -116,6 +129,9 @@ static void cerror(struct shell_ctx *ctx, const char *fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
+  if (ctx->err_fd == FD_CLOSED) {
+    return; /* nowhere to report it, as in sh */
+  }
   if (ctx->err_fd >= 0) {
     ssize_t wr = write(ctx->err_fd, buf, strlen(buf)); /* file: raw */
     (void)wr;
@@ -1100,7 +1116,7 @@ static int cmd_pager(int argc, char **argv, struct shell_ctx *ctx) {
       rc = 1;
       continue;
     }
-    if (!ctx->interactive || ctx->out_fd >= 0) {
+    if (!ctx->interactive || ctx->out_fd != -1) {
       /* no TTY (or redirected): dump like cat */
       char buf[4096];
       size_t n;
@@ -1344,13 +1360,14 @@ static char *read_fd_all(int fd, size_t *outlen) {
 }
 
 /* The fd an output descriptor writes to after redirection: a file opened for
- * it, or what the command started with (base[]; -1 is the terminal). */
+ * it, or what the command started with (base[]; -1 is the terminal), or
+ * FD_CLOSED when it was closed. */
 static int redir_target(const struct cmdline_fd *f, const int *opened,
                         const int *base) {
   if (f->file >= 0) {
     return opened[f->file];
   }
-  return f->orig >= 0 ? base[f->orig] : -1;
+  return f->orig >= 0 ? base[f->orig] : FD_CLOSED;
 }
 
 static int dispatch_one(struct shell_ctx *ctx, char *line) {
@@ -1380,13 +1397,15 @@ static int dispatch_one(struct shell_ctx *ctx, char *line) {
   for (int i = 0; i < r.n; i++) {
     const struct cmdline_redir_op *o = &r.op[i];
     opened[i] = -1;
-    if (o->kind == CMDLINE_DUP) {
+    if (o->kind == CMDLINE_DUP || o->kind == CMDLINE_CLOSE) {
       continue;
     }
     char path[PATH_MAX];
     resolve_path(ctx, o->path, path, sizeof(path));
     int flags = O_RDONLY;
-    if (o->kind == CMDLINE_OUT) {
+    if (o->kind == CMDLINE_RW) {
+      flags = O_RDWR | O_CREAT;
+    } else if (o->kind == CMDLINE_OUT) {
       flags = O_WRONLY | O_CREAT | O_TRUNC;
     } else if (o->kind == CMDLINE_APPEND) {
       flags = O_WRONLY | O_CREAT | O_APPEND;
@@ -1416,6 +1435,9 @@ static int dispatch_one(struct shell_ctx *ctx, char *line) {
     in_data = read_fd_all(opened[fds[0].file], &len);
     ctx->in_buf = in_data ? in_data : "";
     ctx->in_len = in_data ? len : 0;
+  } else if (fds[0].orig < 0) {
+    ctx->in_buf = ""; /* closed: reads see end of file */
+    ctx->in_len = 0;
   } else if (fds[0].orig != 0) {
     ctx->in_buf = NULL;
     ctx->in_len = 0;
@@ -1423,9 +1445,10 @@ static int dispatch_one(struct shell_ctx *ctx, char *line) {
   int base[3] = {-1, saved_out, saved_err};
   ctx->out_fd = redir_target(&fds[1], opened, base);
   ctx->err_fd = redir_target(&fds[2], opened, base);
-  if (ctx->out_fd >= 0) {
+  if (ctx->out_fd != -1) {
     ctx->color = 0; /* no colour escapes in a file */
   }
+  ctx->wr_err = 0;
 
   int status = 127, found = 0;
   for (int i = 0; i < N_COMMANDS; i++) {
@@ -1438,6 +1461,13 @@ static int dispatch_one(struct shell_ctx *ctx, char *line) {
   if (!found) {
     cerror(ctx, "%s: command not found\n", argv[0]);
     status = 127;
+  }
+  if (ctx->wr_err) {
+    cerror(ctx, "%s: write error: Bad file descriptor\n", argv[0]);
+    if (status == 0) {
+      status = 1;
+    }
+    ctx->wr_err = 0;
   }
 
   for (int i = 0; i < r.n; i++) {
@@ -1803,6 +1833,7 @@ void shell_run(ssh_channel channel, int interactive, int rows) {
   ctx.rows = rows;
   ctx.out_fd = -1;
   ctx.err_fd = -1;
+  ctx.wr_err = 0;
   ctx.in_buf = NULL;
   ctx.in_len = 0;
 
@@ -1977,6 +2008,7 @@ int shell_exec(ssh_channel channel, const char *command) {
   ctx.rows = 0;
   ctx.out_fd = -1;
   ctx.err_fd = -1;
+  ctx.wr_err = 0;
   ctx.in_buf = NULL;
   ctx.in_len = 0;
   snprintf(ctx.cwd, sizeof(ctx.cwd), "/");

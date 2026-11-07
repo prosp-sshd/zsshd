@@ -5,6 +5,7 @@
 
 #define NOFILE "error: syntax error: expected filename after redirection"
 #define BADFD "error: syntax error: bad file descriptor number"
+#define BADAMP "error: syntax error: unexpected '&' after redirection"
 
 static int fails = 0;
 static int cases = 0;
@@ -14,9 +15,9 @@ static void put(char *out, size_t cap, const char *s) {
   snprintf(out + n, cap - n, "%s", s);
 }
 
-/* Render one redirection as " <f", " >f" or " >>f", with the descriptor in
+/* Render one redirection as " <f", " >f", " >>f" or " <>f", with the descriptor in
  * front when it is not the operator's default (" 2>f"), or as " N>&M" for a
- * dup (written either way, "N>&M" or "N<&M"). */
+ * dup (written either way, "N>&M" or "N<&M"), or " N>&-" for a close. */
 static void put_redir(char *out, size_t cap, const struct cmdline_redir_op *o) {
   char buf[16];
   if (o->kind == CMDLINE_DUP) {
@@ -24,9 +25,15 @@ static void put_redir(char *out, size_t cap, const struct cmdline_redir_op *o) {
     put(out, cap, buf);
     return;
   }
-  int dflt = o->kind == CMDLINE_IN ? 0 : 1;
+  if (o->kind == CMDLINE_CLOSE) {
+    snprintf(buf, sizeof(buf), " %d>&-", o->fd);
+    put(out, cap, buf);
+    return;
+  }
+  int dflt = o->kind == CMDLINE_IN || o->kind == CMDLINE_RW ? 0 : 1;
   const char *sym = o->kind == CMDLINE_IN    ? "<"
                     : o->kind == CMDLINE_OUT ? ">"
+                    : o->kind == CMDLINE_RW  ? "<>"
                                              : ">>";
   if (o->fd != dflt) {
     snprintf(buf, sizeof(buf), " %d%s", o->fd, sym);
@@ -222,7 +229,18 @@ int main(void) {
   check("echo hi 2>&", BADFD);
   check("echo hi 2>&x", BADFD);
   check("echo hi 2>&12", BADFD);
-  check("echo hi >&-", BADFD);
+  check("echo hi >&--", BADFD);
+  check("echo hi >&'-'", BADFD);
+  check("echo hi >&-x", BADFD);
+  check("echo hi >&", BADFD);
+  check("echo hi >>&1", BADAMP);
+  check("echo hi >>& 1", BADAMP);
+  check("echo hi 2>>&1", BADAMP);
+  check("echo hi >>&-", BADAMP);
+  check("cat <>&0", BADAMP);
+  check("cat <>", NOFILE);
+  check("cat <> > f", NOFILE);
+  check("cat <>\"\"", NOFILE);
   check("echo hi 12>f", BADFD);
   check("a 1>a 2>b 3>c 4>d 5>e 6>f 7>g 8>h 9>i",
         "error: syntax error: too many redirections");
@@ -249,6 +267,23 @@ int main(void) {
   check("ls x 2>&1 | grep x", "[ls][x] 2>&1 | [grep][x]");
   check("ls x 2>err | wc", "[ls][x] 2>err | [wc]");
   check("ls x 2>>err | wc > out", "[ls][x] 2>>err | [wc] >out");
+  /* close: N>&- and N<&- */
+  check("echo hi >&-", "[echo][hi] 1>&-");
+  check("echo hi 2>&-", "[echo][hi] 2>&-");
+  check("cat <&-", "[cat] 0>&-");
+  check("cat 3<&-", "[cat] 3>&-");
+  check("echo hi 2>& -", "[echo][hi] 2>&-");
+  check("echo hi 2>&-;echo x", "[echo][hi] 2>&- ; [echo][x]");
+  check("ls x 2>&- | wc", "[ls][x] 2>&- | [wc]");
+  check("echo hi 2>&- >f", "[echo][hi] 2>&- >f");
+  /* read-write: N<>f */
+  check("cat <>f", "[cat] <>f");
+  check("cat <> f", "[cat] <>f");
+  check("cat 0<>f", "[cat] <>f");
+  check("echo hi 3<>f", "[echo][hi] 3<>f");
+  check("echo hi 1<>f", "[echo][hi] 1<>f");
+  check("cat <>\"my file\"", "[cat] <>my file");
+  check("echo '<>' a\\<\\>b", "[echo][<>][a<>b]");
   /* not a descriptor: quoted, escaped, not all digits, or not glued */
   check("echo hi '2'>f", "[echo][hi][2] >f");
   check("echo hi \"2\">f", "[echo][hi][2] >f");
@@ -274,6 +309,21 @@ int main(void) {
   checkr("ls 2>&1 1>&2", "0:&0 1:&1 2:&1");
   checkr("ls 3>f 1>&3", "0:&0 1:f 2:&2");
   checkr("ls 3>f 2>&3 3>g", "0:&0 1:&1 2:f");
+  checkr("ls >&-", "0:&0 1:- 2:&2");
+  checkr("ls 2>&-", "0:&0 1:&1 2:-");
+  checkr("cat <&-", "0:- 1:&1 2:&2");
+  checkr("ls >&- 2>&1", "error: redirection: bad file descriptor");
+  checkr("ls 2>&1 >&-", "0:&0 1:- 2:&1");
+  checkr("ls >f >&-", "0:&0 1:- 2:&2");
+  checkr("ls >&- >f", "0:&0 1:f 2:&2");
+  checkr("ls 3>f 3>&- 1>&3", "error: redirection: bad file descriptor");
+  checkr("ls 3>&- 1>&3", "error: redirection: bad file descriptor");
+  checkr("ls 2>&- 1>&2", "error: redirection: bad file descriptor");
+  checkr("cat <>f", "0:f 1:&1 2:&2");
+  checkr("cat <>f >&0", "0:f 1:f 2:&2");
+  checkr("cat <>f 2>&0", "0:f 1:&1 2:f");
+  checkr("ls 3<>f 1>&3", "0:&0 1:f 2:&2");
+  checkr("ls 1<>f", "0:&0 1:f 2:&2");
   checkr("ls 1>&5", "error: redirection: bad file descriptor");
   checkr("ls 2>&2", "0:&0 1:&1 2:&2");
 

@@ -114,6 +114,7 @@ static char *scan_word(struct scan *s, int *quoted, const char **err) {
 
 #define NO_FILE "syntax error: expected filename after redirection"
 #define BAD_FD "syntax error: bad file descriptor number"
+#define BAD_AMP "syntax error: unexpected '&' after redirection"
 
 /* The single-digit descriptor in `w`, or -1. */
 static int fd_number(const char *w) {
@@ -133,9 +134,16 @@ static int scan_redir(struct scan *s, char op, int fd, struct cmdline_redir *r,
   if (op == '>' && *s->r == '>') {
     o.kind = CMDLINE_APPEND;
     s->r++;
+  } else if (op == '<' && *s->r == '>') {
+    o.kind = CMDLINE_RW;
+    s->r++;
   } else if (*s->r == '&') {
     o.kind = CMDLINE_DUP;
     s->r++;
+  }
+  if ((o.kind == CMDLINE_APPEND || o.kind == CMDLINE_RW) && *s->r == '&') {
+    *err = BAD_AMP;
+    return -1;
   }
   while (is_blank(*s->r)) {
     s->r++;
@@ -150,10 +158,14 @@ static int scan_redir(struct scan *s, char op, int fd, struct cmdline_redir *r,
     return -1;
   }
   if (o.kind == CMDLINE_DUP) {
-    o.dup_fd = fd_number(word);
-    if (o.dup_fd < 0) {
-      *err = BAD_FD;
-      return -1;
+    if (!quoted && word[0] == '-' && word[1] == '\0') {
+      o.kind = CMDLINE_CLOSE;
+    } else {
+      o.dup_fd = fd_number(word);
+      if (o.dup_fd < 0) {
+        *err = BAD_FD;
+        return -1;
+      }
     }
   } else if (*word == '\0') {
     *err = NO_FILE;
@@ -227,7 +239,10 @@ int cmdline_route(const struct cmdline_redir *r, struct cmdline_fd *fds,
   }
   for (int i = 0; i < r->n; i++) {
     const struct cmdline_redir_op *o = &r->op[i];
-    if (o->kind == CMDLINE_DUP) {
+    if (o->kind == CMDLINE_CLOSE) {
+      fds[o->fd].file = -1;
+      fds[o->fd].orig = -1;
+    } else if (o->kind == CMDLINE_DUP) {
       struct cmdline_fd src = fds[o->dup_fd];
       if (src.file < 0 && src.orig < 0) {
         *err = "redirection: bad file descriptor";
