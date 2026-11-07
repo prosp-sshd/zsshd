@@ -25,7 +25,14 @@ other payloads/mods can automate against it.
   - Piping commands (no PTY) runs them line-by-line with clean, uncolored output.
   - `;` and newlines separate multiple commands.
   - Redirection: `cmd > file` (truncate), `cmd >> file` (append), `cmd < file` (stdin).
+  - Descriptor redirection (digits 0-9): `cmd 2> file`, `cmd 2>> file`, `cmd 2>&1`,
+    `cmd 3< file`, `cmd 1>&3`, `cmd 2>&-` (close), `cmd <> file` (read-write). Applied
+    left to right as in sh, so `cmd > f 2>&1` sends both streams to `f` and
+    `cmd 2>&1 > f` does not. `>>&1` is a syntax error, not a file named `&1`.
   - Pipes: `cmd1 | cmd2` feeds one built-in's output into the next (e.g. `ps | grep ...`).
+  - Quoting: `"..."`, `'...'` and `\` escapes, so paths with spaces work
+    (`cd "My Folder"`, `cat my\ file.txt`). A quoted or escaped `>`, `<`, `|`
+    or `;` is a literal character, not an operator.
 - Single-instance control: a new copy asks a running one to stand down.
 - On-screen toast on startup showing the listening `IP:port`.
 
@@ -89,6 +96,13 @@ Output: `zsshd.elf`.
 > **GEN_FILES:** `-DGEN_FILES=OFF` uses the generated files already present in
 > the 3.6.7 checkout. If your checkout is missing them, use `-DGEN_FILES=ON`
 > (requires Python 3 + `jinja2`).
+
+The shell's command-line parser (`src/app/cmdline.c`) is plain C with no PS5
+calls; its unit test runs on the host with any C compiler:
+
+```fish
+sh test/host/cmdline.sh
+```
 
 ## Deploying
 

@@ -20,6 +20,7 @@ SRCS := \
 	src/app/zsshd_config.c \
 	src/app/firstrun.c \
 	src/app/shell.c \
+	src/app/cmdline.c \
 	src/platform/pal_notification.c \
 	src/platform/ps5_syscall.S
 
