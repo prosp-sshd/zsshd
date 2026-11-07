@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "cmdline.h"
+#include "timeutil.h"
 #include "zsshd_version.h"
 
 #if defined(PLATFORM_PS5)
@@ -519,6 +520,132 @@ static int cmd_uname(int argc, char **argv, struct shell_ctx *ctx) {
   } else {
     cprintf(ctx, "%s\n", u.sysname);
   }
+  return 0;
+}
+
+/* Boot time from the kernel, or -1 if the kernel does not answer. */
+static int read_boottime(struct timeval *tv) {
+  int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+  size_t len = sizeof(*tv);
+  memset(tv, 0, sizeof(*tv));
+  if (sysctl(mib, 2, tv, &len, NULL, 0) != 0 || len < sizeof(*tv) ||
+      tv->tv_sec == 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int cmd_uptime(int argc, char **argv, struct shell_ctx *ctx) {
+  enum uptime_mode mode = uptime_parse(argc, argv);
+  if (mode == UPTIME_MODE_USAGE) {
+    cerror(ctx, "uptime: usage: uptime [-s | -v]\n");
+    return 1;
+  }
+
+  struct timeval boot;
+  int have_boot = (read_boottime(&boot) == 0);
+  struct timespec up;
+  int have_up = (clock_gettime(CLOCK_UPTIME, &up) == 0);
+  struct timespec now;
+  int have_now = (clock_gettime(CLOCK_REALTIME, &now) == 0);
+
+  if (mode == UPTIME_MODE_VERBOSE) {
+    if (have_boot) {
+      cprintf(ctx, "kern.boottime: %lld.%06ld", (long long)boot.tv_sec,
+              (long)boot.tv_usec);
+      if (have_now) {
+        cprintf(ctx, " (now - boottime = %lld s)",
+                (long long)(now.tv_sec - boot.tv_sec));
+      }
+      cputs(ctx, "\n");
+    } else {
+      cputs(ctx, "kern.boottime: unavailable\n");
+    }
+    if (have_up) {
+      cprintf(ctx, "CLOCK_UPTIME: %lld.%09ld s\n", (long long)up.tv_sec,
+              (long)up.tv_nsec);
+    } else {
+      cputs(ctx, "CLOCK_UPTIME: unavailable\n");
+    }
+    if (!have_boot && !have_up) {
+      cerror(ctx, "uptime: cannot read boot time or uptime clock\n");
+      return 1;
+    }
+    return 0;
+  }
+
+  /* CLOCK_UPTIME keeps counting through rest mode while kern.boottime is moved
+   * forward by the time spent asleep, so the clock is preferred and the sysctl
+   * is the fallback. */
+  if (mode == UPTIME_MODE_SINCE) {
+    time_t t;
+    if (have_up && have_now) {
+      t = (time_t)(now.tv_sec - up.tv_sec);
+    } else if (have_boot) {
+      t = (time_t)boot.tv_sec;
+    } else {
+      cerror(ctx, "uptime: cannot read boot time or uptime clock\n");
+      return 1;
+    }
+    struct tm tmv;
+    char out[64];
+    if (localtime_r(&t, &tmv) == NULL ||
+        strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", &tmv) == 0) {
+      cerror(ctx, "uptime: cannot format boot time\n");
+      return 1;
+    }
+    cprintf(ctx, "%s\n", out);
+    return 0;
+  }
+
+  long long secs;
+  if (have_up) {
+    secs = (long long)up.tv_sec;
+  } else if (have_boot && have_now) {
+    secs = (long long)(now.tv_sec - boot.tv_sec);
+  } else {
+    cerror(ctx, "uptime: cannot read boot time or uptime clock\n");
+    return 1;
+  }
+  char buf[64];
+  uptime_format(secs, buf, sizeof(buf));
+  cprintf(ctx, "%s\n", buf);
+  return 0;
+}
+
+static int cmd_date(int argc, char **argv, struct shell_ctx *ctx) {
+  enum date_mode mode = date_parse(argc, argv);
+  if (mode == DATE_MODE_USAGE) {
+    cerror(ctx, "date: usage: date [-u]\n");
+    return 1;
+  }
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+    cerror(ctx, "date: cannot read the clock\n");
+    return 1;
+  }
+  time_t t = (time_t)now.tv_sec;
+  struct tm tmv;
+  char out[96];
+  /* Only the nine standard struct tm fields are read: the console's libc
+   * leaves tm_gmtoff and tm_zone unset (reading tm_zone crashed the daemon),
+   * so the zone is printed as a numeric offset worked out from those fields. */
+  memset(&tmv, 0, sizeof(tmv));
+  if (mode == DATE_MODE_LOCAL && localtime_r(&t, &tmv) != NULL &&
+      strftime(out, sizeof(out), "%a %b %e %H:%M:%S", &tmv) != 0) {
+    char zone[16];
+    utc_offset_format(tm_utc_offset(&tmv, (long long)t), zone, sizeof(zone));
+    cprintf(ctx, "%s %s %d\n", out, zone, tmv.tm_year + 1900);
+    return 0;
+  }
+  /* -u, or local time unavailable: print UTC, labelled as such. */
+  memset(&tmv, 0, sizeof(tmv));
+  if (gmtime_r(&t, &tmv) == NULL ||
+      strftime(out, sizeof(out), "%a %b %e %H:%M:%S UTC %Y", &tmv) == 0) {
+    cerror(ctx, "date: cannot format the time\n");
+    return 1;
+  }
+  cprintf(ctx, "%s\n", out);
   return 0;
 }
 
@@ -1342,6 +1469,7 @@ static const struct command COMMANDS[] = {
     {"rm", cmd_rm},       {"cp", cmd_cp},       {"mv", cmd_mv},
     {"head", cmd_head},   {"tail", cmd_tail},   {"grep", cmd_grep},
     {"less", cmd_pager},  {"more", cmd_pager},
+    {"uptime", cmd_uptime}, {"date", cmd_date},
     {"ps", cmd_ps},       {"kill", cmd_kill},
     {"exit", cmd_exit},   {"quit", cmd_exit},
 };
