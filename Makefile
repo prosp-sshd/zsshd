@@ -20,6 +20,7 @@ SRCS := \
 	src/app/zsshd_config.c \
 	src/app/firstrun.c \
 	src/app/shell.c \
+	src/app/timeutil.c \
 	src/platform/pal_notification.c
 
 CFLAGS := -Wall -Werror -g
