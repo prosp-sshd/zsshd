@@ -2,6 +2,6 @@
 #define ZSSHD_VERSION_H
 
 /* Single source of truth for the payload version. Bump this one line. */
-#define ZSSHD_VERSION "0.8.1"
+#define ZSSHD_VERSION "0.8.1-prosp.1"
 
 #endif /* ZSSHD_VERSION_H */
