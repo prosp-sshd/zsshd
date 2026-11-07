@@ -25,6 +25,10 @@ other payloads/mods can automate against it.
   - Piping commands (no PTY) runs them line-by-line with clean, uncolored output.
   - `;` and newlines separate multiple commands.
   - Redirection: `cmd > file` (truncate), `cmd >> file` (append), `cmd < file` (stdin).
+  - Descriptor redirection (digits 0-9): `cmd 2> file`, `cmd 2>> file`, `cmd 2>&1`,
+    `cmd 3< file`, `cmd 1>&3`. Applied left to right as in sh, so `cmd > f 2>&1` sends
+    both streams to `f` and `cmd 2>&1 > f` does not. Not supported: closing (`N>&-`)
+    and read-write (`<>`).
   - Pipes: `cmd1 | cmd2` feeds one built-in's output into the next (e.g. `ps | grep ...`).
   - Quoting: `"..."`, `'...'` and `\` escapes, so paths with spaces work
     (`cd "My Folder"`, `cat my\ file.txt`). A quoted or escaped `>`, `<`, `|`
