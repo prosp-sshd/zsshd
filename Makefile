@@ -21,6 +21,7 @@ SRCS := \
 	src/app/firstrun.c \
 	src/app/shell.c \
 	src/app/cmdline.c \
+	src/app/diskfmt.c \
 	src/app/timeutil.c \
 	src/platform/pal_notification.c \
 	src/platform/ps5_syscall.S
