@@ -19,7 +19,8 @@ other payloads/mods can automate against it.
   (Up/Down), and in-line editing (Left/Right, Home/End, Delete).
 - Built-in commands: `ls cd pwd cat echo whoami uname clear help exit`,
   `mkdir rmdir touch rm cp mv`, `head tail grep`, `less` (alias of `cat`),
-  `ps` and `kill`.
+  `ps` and `kill`, `df [-a] [-h] [path...]` (mounted filesystems, or the one
+  holding each path: size, used, available, `Use%`) and `du [-s] [-h] [path...]` (disk usage of a tree).
 - **Scripting / automation:**
   - `ssh root@ps5 'cmd1; cmd2'` runs the command(s) and returns their exit status.
   - Piping commands (no PTY) runs them line-by-line with clean, uncolored output.

@@ -1,4 +1,5 @@
 #include "shell.h"
+#include "diskfmt.h"
 #include "zsshd_version.h"
 
 #if defined(PLATFORM_PS5)
@@ -9,9 +10,12 @@
 #include <regex.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <signal.h>
 #include <strings.h>
@@ -1298,6 +1302,225 @@ static int cmd_kill(int argc, char **argv, struct shell_ctx *ctx) {
   return rc;
 }
 
+/* --- df / du --------------------------------------------------------------
+ *
+ *   df [-a] [-h] [path...]
+ *                    one row per mounted filesystem: Filesystem Size Used Avail
+ *                    Use% Mounted on. Sizes are 1K blocks, or -h units. Zero-
+ *                    size pseudo filesystems and per-app sandbox mounts are
+ *                    skipped unless -a. With path operands, one row per path:
+ *                    the filesystem holding it (statfs; -a is moot). A path
+ *                    that cannot be read is reported and the status is 1.
+ *   du [-s] [-h] [path...]
+ *                    disk usage of each path (default "."): the sum of lstat
+ *                    st_blocks * 512 over the tree, no symlink following, not
+ *                    crossing onto another device. Prints "<size>\t<path>" per
+ *                    directory (post-order), or only per argument with -s.
+ *                    Sizes are 1K blocks rounded up, or -h units. An entry that
+ *                    cannot be read is reported and the walk goes on;
+ *                    the exit status is then 1. Hard links count once per name. */
+
+/* Without -a, df skips zero-size pseudo filesystems and per-app sandbox mounts. */
+static int df_shown(const struct statfs *f) {
+  return f->f_blocks != 0 && !diskfmt_is_sandbox_mount(f->f_mntonname);
+}
+
+/* Print one df row for fs; the Filesystem column is w wide. */
+static void df_print(struct shell_ctx *ctx, const struct statfs *f, int w,
+                     int human) {
+  char row[2 * PATH_MAX + 128];
+  diskfmt_df_row(row, sizeof(row), w, f->f_mntfromname, f->f_mntonname,
+                 f->f_blocks, f->f_bfree, (int64_t)f->f_bavail, f->f_bsize,
+                 human);
+  cprintf(ctx, "%s\n", row);
+}
+
+static int cmd_df(int argc, char **argv, struct shell_ctx *ctx) {
+  int all = 0, human = 0, opts = 1;
+  int a = 1;
+  for (; a < argc && opts; a++) {
+    const char *o = argv[a];
+    if (o[0] != '-' || o[1] == '\0') {
+      break;
+    }
+    if (strcmp(o, "--") == 0) {
+      a++;
+      break;
+    }
+    for (const char *c = o + 1; *c; c++) {
+      if (*c == 'a') {
+        all = 1;
+      } else if (*c == 'h') {
+        human = 1;
+      } else {
+        cerror(ctx,
+               "df: invalid option -- %c\nusage: df [-a] [-h] [path...]\n", *c);
+        return 1;
+      }
+    }
+  }
+  int w = 10;
+  char line[2 * PATH_MAX + 128];
+  if (a < argc) {
+    /* One row per path operand: the filesystem holding it. */
+    int nops = argc - a;
+    struct statfs *sf = calloc((size_t)nops, sizeof(*sf));
+    char *ok = calloc((size_t)nops, 1);
+    if (sf == NULL || ok == NULL) {
+      free(sf);
+      free(ok);
+      cerror(ctx, "df: out of memory\n");
+      return 1;
+    }
+    int rc = 0;
+    for (int i = 0; i < nops; i++) {
+      char path[PATH_MAX];
+      resolve_path(ctx, argv[a + i], path, sizeof(path));
+      if (statfs(path, &sf[i]) != 0) {
+        cerror(ctx, "df: %s: %s\n", argv[a + i], strerror(errno));
+        rc = 1;
+        continue;
+      }
+      ok[i] = 1;
+      int l = (int)strlen(sf[i].f_mntfromname);
+      if (l > w) {
+        w = l;
+      }
+    }
+    diskfmt_df_header(line, sizeof(line), w);
+    cprintf(ctx, "%s\n", line);
+    for (int i = 0; i < nops; i++) {
+      if (ok[i]) {
+        df_print(ctx, &sf[i], w, human);
+      }
+    }
+    free(sf);
+    free(ok);
+    return rc;
+  }
+  struct statfs *fs = NULL;
+  int n = getmntinfo(&fs, MNT_NOWAIT);
+  if (n <= 0 || fs == NULL) {
+    cerror(ctx, "df: cannot read the mount table: %s\n", strerror(errno));
+    return 1;
+  }
+  for (int i = 0; i < n; i++) {
+    int l = (int)strlen(fs[i].f_mntfromname);
+    if ((all || df_shown(&fs[i])) && l > w) {
+      w = l;
+    }
+  }
+  diskfmt_df_header(line, sizeof(line), w);
+  cprintf(ctx, "%s\n", line);
+  for (int i = 0; i < n; i++) {
+    if (all || df_shown(&fs[i])) {
+      df_print(ctx, &fs[i], w, human);
+    }
+  }
+  return 0;
+}
+
+struct du_opts {
+  int human;
+  int summary;
+  int errors;
+};
+
+static void du_print(struct shell_ctx *ctx, const struct du_opts *o,
+                     uint64_t bytes, const char *path) {
+  char sz[32];
+  if (o->human) {
+    diskfmt_human(bytes, sz, sizeof(sz));
+  } else {
+    snprintf(sz, sizeof(sz), "%llu", (unsigned long long)((bytes + 1023) / 1024));
+  }
+  cprintf(ctx, "%s\t%s\n", sz, path);
+}
+
+/* Total bytes under path. disp is the same path as the user typed it, used for
+ * output and messages. Prints a line per directory unless o->summary; dev is
+ * the starting device. */
+static uint64_t du_walk(struct shell_ctx *ctx, struct du_opts *o,
+                        const char *path, const char *disp, dev_t dev,
+                        int top) {
+  struct stat st;
+  if (lstat(path, &st) != 0) {
+    cerror(ctx, "du: %s: %s\n", disp, strerror(errno));
+    o->errors = 1;
+    return 0;
+  }
+  if (st.st_dev != dev) {
+    return 0;
+  }
+  uint64_t total = (uint64_t)st.st_blocks * 512;
+  if (!S_ISDIR(st.st_mode)) {
+    if (top) {
+      du_print(ctx, o, total, disp);
+    }
+    return total;
+  }
+  DIR *d = opendir(path);
+  if (!d) {
+    cerror(ctx, "du: %s: %s\n", disp, strerror(errno));
+    o->errors = 1;
+  } else {
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+        continue;
+      }
+      char c[PATH_MAX], cd[PATH_MAX];
+      snprintf(c, sizeof(c), "%s/%s", path, e->d_name);
+      snprintf(cd, sizeof(cd), "%s/%s", disp, e->d_name);
+      total += du_walk(ctx, o, c, cd, dev, 0);
+    }
+    closedir(d);
+  }
+  if (!o->summary || top) {
+    du_print(ctx, o, total, disp);
+  }
+  return total;
+}
+
+static int cmd_du(int argc, char **argv, struct shell_ctx *ctx) {
+  struct du_opts o = {0, 0, 0};
+  int start = 1;
+  for (; start < argc && argv[start][0] == '-' && argv[start][1] != '\0';
+       start++) {
+    for (const char *c = argv[start] + 1; *c; c++) {
+      if (*c == 's') {
+        o.summary = 1;
+      } else if (*c == 'h') {
+        o.human = 1;
+      } else {
+        cerror(ctx, "du: invalid option -- %c\nusage: du [-s] [-h] [path...]\n",
+               *c);
+        return 1;
+      }
+    }
+  }
+  static char dot[] = ".";
+  char *def[] = {dot};
+  char **paths = argv + start;
+  int np = argc - start;
+  if (np == 0) {
+    paths = def;
+    np = 1;
+  }
+  for (int a = 0; a < np; a++) {
+    char path[PATH_MAX];
+    resolve_path(ctx, paths[a], path, sizeof(path));
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+      cerror(ctx, "du: %s: %s\n", paths[a], strerror(errno));
+      o.errors = 1;
+      continue;
+    }
+    du_walk(ctx, &o, path, paths[a], st.st_dev, 1);
+  }
+  return o.errors;
+}
+
 /* --- dispatch table ---------------------------------------------------- */
 
 struct command {
@@ -1314,6 +1537,7 @@ static const struct command COMMANDS[] = {
     {"head", cmd_head},   {"tail", cmd_tail},   {"grep", cmd_grep},
     {"less", cmd_pager},  {"more", cmd_pager},
     {"ps", cmd_ps},       {"kill", cmd_kill},
+    {"df", cmd_df},       {"du", cmd_du},
     {"exit", cmd_exit},   {"quit", cmd_exit},
 };
 static const int N_COMMANDS = (int)(sizeof(COMMANDS) / sizeof(COMMANDS[0]));
